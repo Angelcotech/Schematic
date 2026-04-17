@@ -122,4 +122,32 @@ rg '\|\|\s' app/src
 
 ---
 
+## Stage 4 scan
+
+**Date:** 2026-04-17
+**Scope:** `app/src/cli/**`, `app/src/daemon/http.ts` (endpoint additions), `app/src/daemon/index.ts`
+
+**Commands used:**
+```
+rg 'catch\s*[\({]|try\s*\{|fallback|retry' app/src/cli app/src/daemon
+rg '\?\?\s' app/src/cli
+```
+
+**Findings:**
+
+| Location | Pattern | Decision |
+|----------|---------|----------|
+| `cli/index.ts:119` | `main().catch((e) => { console.error; exit(1); })` | **Justified.** CLI top-level error boundary. Converts unhandled rejection into a clean exit-with-message. Standard node-CLI pattern. |
+| `cli/utils/daemon-client.ts:13-16` | `isDaemonRunning` try/catch | **Justified.** Catches ECONNREFUSED specifically (both plain and undici-nested `cause.code` shapes) to answer the literal question "is the daemon running?" Re-throws any unexpected error. |
+| `cli/utils/settings-writer.ts:33-40` | nested try/catch around `readFile` + `JSON.parse` | **Justified.** Outer ENOENT → new-install state (empty settings). Inner JSON-parse failure → explicit throw that refuses to overwrite unreadable user content. No silent recovery. |
+| `cli/commands/start.ts:28-39` | polling loop waiting for daemon to respond | **Justified.** 5-second hardwired deadline; on expiry, throws. Not an open-ended retry. Documented. |
+| `cli/commands/stop.ts:9-17` | polling loop after shutdown request | **Justified.** Same shape as start: 2-second deadline, throws on expiry. |
+| `cli/commands/hook-template.ts` (script generated at install) | `req.on("error") → exit(0)` and `on("timeout") → exit(0)` | **Justified deliberate design.** The hook must NOT block a CC session when Schematic's daemon is unreachable. Silent exit-0 with empty stdout → CC proceeds normally. This is the reference-surface identity (§1 Product in BUILDING_PLAN): Schematic is peripheral and must never break the user's primary tool. Documented in-file. |
+| `cli/index.ts:82-88` | `rest[0] ?? process.cwd()` for activate/pause/resume/disable args | **Justified.** Explicit argument default — when the user runs the command without a path, use cwd. Parameterization, not a fallback. |
+| `cli/utils/settings-writer.ts:84` | `settings.hooks[event] ?? []` | **Justified.** Object-extension pattern: if the event's matcher list doesn't exist yet, start empty before appending our entry. Not hiding missing data. |
+
+**Outcome:** 0 fallbacks removed, 8 patterns reviewed and justified (all either error boundaries, explicit deadlines, or documented reference-surface design decisions).
+
+---
+
 _(future stages appended here)_

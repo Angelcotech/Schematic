@@ -25,7 +25,10 @@ export async function startDaemon(): Promise<DaemonHandle> {
     state: { eventCount: 0 },
   };
 
-  httpServer.on("request", createRequestHandler(ctx));
+  // requestShutdown lets the POST /shutdown handler trigger graceful stop.
+  // Populated below after `stop` is defined.
+  let triggerShutdown: () => void = () => {};
+  httpServer.on("request", createRequestHandler(ctx, () => triggerShutdown()));
 
   await new Promise<void>((resolve, reject) => {
     httpServer.once("error", reject);
@@ -36,16 +39,19 @@ export async function startDaemon(): Promise<DaemonHandle> {
   console.log(`[schematic] ws://127.0.0.1:${config.port}/ws`);
   console.log(`[schematic] workspaces loaded: ${registry.all().length}`);
 
-  return {
-    port: config.port,
-    stop: async () => {
-      console.log("[schematic] shutdown: closing ws clients");
-      ws.close();
-      console.log("[schematic] shutdown: closing http server");
-      await new Promise<void>((resolve) => httpServer.close(() => resolve()));
-      console.log("[schematic] shutdown: persisting registry");
-      await registry.save();
-      console.log("[schematic] stopped");
-    },
+  const stop = async (): Promise<void> => {
+    console.log("[schematic] shutdown: closing ws clients");
+    ws.close();
+    console.log("[schematic] shutdown: closing http server");
+    await new Promise<void>((resolve) => httpServer.close(() => resolve()));
+    console.log("[schematic] shutdown: persisting registry");
+    await registry.save();
+    console.log("[schematic] stopped");
   };
+
+  triggerShutdown = () => {
+    void stop().then(() => process.exit(0));
+  };
+
+  return { port: config.port, stop };
 }

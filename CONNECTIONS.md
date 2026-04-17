@@ -173,7 +173,43 @@ Edges point from producer to consumer.
 - **Home:** `app/src/daemon/persist/`
 - **Files:** `paths.ts` (constants), `atomic-write.ts`, `config.ts`
 - **Outputs:** `SchematicConfig`, initialized directory structure under `~/.schematic/`
-- **Consumers:** registry (save), daemon index (readOrInitConfig), future Stage 4 CLI
+- **Consumers:** registry (save), daemon index (readOrInitConfig), CLI (`cli/commands/config.ts`, `cli/utils/daemon-client.ts`, `cli/commands/install.ts`)
+
+### CLI entry (`cli/index.ts`)
+- **Home:** `app/src/cli/index.ts`
+- **Inputs:** `process.argv` (subcommand dispatch)
+- **Outputs:** delegates to command modules; top-level error boundary
+- **Dependencies:** all files under `cli/commands/` and `cli/utils/`
+- **Consumers:** `schematic` binary (via `package.json#bin`); dev via `pnpm --filter @schematic/app cli ...`
+
+### CLI commands
+- **Home:** `app/src/cli/commands/`
+- **Files:** `install.ts`, `uninstall.ts`, `start.ts`, `stop.ts`, `status.ts`, `workspaces.ts`, `state.ts` (activate/pause/resume/disable), `config.ts`, `log.ts`
+- **Inputs:** parsed argv values from `cli/index.ts`
+- **Outputs:** side effects (daemon HTTP calls, settings.json writes, file writes) + terminal output
+- **Dependencies:** `cli/utils/daemon-client.ts`, `cli/utils/settings-writer.ts`, `daemon/persist/config.ts`
+- **Consumers:** `cli/index.ts`
+
+### Daemon HTTP client (`cli/utils/daemon-client.ts`)
+- **Home:** `app/src/cli/utils/daemon-client.ts`
+- **Inputs:** port (from `~/.schematic/config.json`)
+- **Outputs:** typed responses from daemon endpoints (`getStatus`, `listWorkspaces`, `createWorkspace`, `transitionWorkspace`, `forgetWorkspace`, `resolveCwd`, `shutdownDaemon`, `isDaemonRunning`)
+- **Dependencies:** global `fetch`, `ws` for future log streaming
+- **Consumers:** every CLI command that talks to the daemon
+
+### Settings writer (`cli/utils/settings-writer.ts`)
+- **Home:** `app/src/cli/utils/settings-writer.ts`
+- **Inputs:** absolute hook-script path, current `~/.claude/settings.json`
+- **Outputs:** atomically-written `~/.claude/settings.json` with Schematic entries added/removed. Entries tagged `_schematic: "schematic"` for idempotent remove.
+- **Dependencies:** `daemon/persist/atomic-write.ts`
+- **Consumers:** `install.ts`, `uninstall.ts`
+
+### Hook script template (`cli/hook-template.ts`)
+- **Home:** `app/src/cli/hook-template.ts` (template generator); emits to `~/.schematic/hooks/hook.mjs` at install time
+- **Inputs:** stdin JSON from Claude Code; daemon port
+- **Outputs:** stdout — whatever the daemon's `/hook` endpoint returns (either `{}` or `{hookSpecificOutput: {additionalContext}}` for UserPromptSubmit)
+- **Hardwired silence:** on daemon unreachable, exits 0 with empty stdout so CC proceeds normally. Documented as deliberate reference-surface design, not a fallback.
+- **Consumers:** Claude Code itself (invokes per PreToolUse / PostToolUse / UserPromptSubmit)
 
 ---
 
@@ -220,3 +256,4 @@ _(to be recorded in Stage 11)_
 | 2026-04-17 | 2.5-2.7 | `main.ts` rewritten: graph render loop, hover, click-select, Space cycles ai_intent, Esc deselects, F fits to screen |
 | 2026-04-17 | 2.x | Zoom tuning: accumulator+threshold pattern ported from GateStack Pro (80-unit threshold, 1.08 factor per step). `viewport.zoom()` fixed to anchor on cursor data point. Halo scaled as fraction of node size, colors more saturated. |
 | 2026-04-17 | 3.1-3.8 | Daemon skeleton: app workspace scaffolding, HTTP (status/workspaces/hook), WebSocket (ready + event broadcast), workspace registry with 3-state machine, cwd router with marker-based auto-activation, config + atomic persistence, SIGTERM/SIGINT graceful shutdown. Shared types: Workspace, HookPayload, SchematicEvent, WS messages. |
+| 2026-04-17 | 4.1-4.8 | Install CLI. New daemon endpoints: POST /shutdown, POST /workspaces (create), POST /workspaces/:id/state, DELETE /workspaces/:id, GET /resolve. POST /hook now accepts CC-native payload shape and returns hookSpecificOutput for UserPromptSubmit. CLI: start/stop/restart/status, install/uninstall, workspaces list/forget, activate/pause/resume/disable, config get/set, log --tail. Install writes hook.mjs to ~/.schematic/hooks/ and idempotent Schematic-tagged entries to ~/.claude/settings.json. Live-tested end-to-end against real ~/.claude/settings.json (backed up + restored). |

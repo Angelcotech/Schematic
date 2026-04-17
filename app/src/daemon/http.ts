@@ -20,7 +20,10 @@ export interface DaemonContext {
   state: { eventCount: number };
 }
 
-export function createRequestHandler(ctx: DaemonContext): (req: IncomingMessage, res: ServerResponse) => void {
+export function createRequestHandler(
+  ctx: DaemonContext,
+  requestShutdown: () => void,
+): (req: IncomingMessage, res: ServerResponse) => void {
   return async (req, res) => {
     try {
       const { url, method } = req;
@@ -28,7 +31,10 @@ export function createRequestHandler(ctx: DaemonContext): (req: IncomingMessage,
         return err(res, 400, "malformed request: missing url or method");
       }
 
-      if (method === "GET" && url === "/status") {
+      const parsed = new URL(url, "http://localhost");
+      const path = parsed.pathname;
+
+      if (method === "GET" && path === "/status") {
         return json(res, 200, {
           ok: true,
           uptime_ms: Date.now() - ctx.startedAt,
@@ -38,18 +44,78 @@ export function createRequestHandler(ctx: DaemonContext): (req: IncomingMessage,
         });
       }
 
-      if (method === "GET" && url === "/workspaces") {
+      if (method === "POST" && path === "/shutdown") {
+        json(res, 200, { ok: true });
+        setImmediate(requestShutdown);
+        return;
+      }
+
+      if (method === "GET" && path === "/workspaces") {
         return json(res, 200, ctx.registry.all());
       }
 
-      if (method === "POST" && url === "/hook") {
-        const body = await readBody(req);
-        const payload = JSON.parse(body) as HookPayload;
-        await handleHook(ctx, payload);
+      if (method === "POST" && path === "/workspaces") {
+        const body = JSON.parse(await readBody(req)) as { path: string };
+        const { path: rootPath } = body;
+        if (!rootPath) return err(res, 400, "missing field: path");
+        const existing = ctx.registry.findByRoot(rootPath);
+        if (existing) return json(res, 200, existing);
+        const ws = newWorkspace(rootPath);
+        await ctx.registry.create(ws);
+        ctx.ws.broadcast({ type: "workspace.activated", workspace: ws, timestamp: Date.now() }, ws.id);
+        return json(res, 201, ws);
+      }
+
+      // /workspaces/:id/state — POST { to: WorkspaceState }
+      const stateMatch = /^\/workspaces\/([^/]+)\/state$/.exec(path);
+      if (method === "POST" && stateMatch) {
+        const id = stateMatch[1];
+        const body = JSON.parse(await readBody(req)) as { to: "active" | "paused" | "disabled" };
+        const ws = await ctx.registry.transition(id, body.to);
+        const evType =
+          body.to === "active"
+            ? "workspace.resumed"
+            : body.to === "paused"
+              ? "workspace.paused"
+              : "workspace.disabled";
+        ctx.ws.broadcast({ type: evType, workspace_id: ws.id, timestamp: Date.now() }, ws.id);
+        return json(res, 200, ws);
+      }
+
+      // /workspaces/:id — DELETE (forget)
+      const idMatch = /^\/workspaces\/([^/]+)$/.exec(path);
+      if (method === "DELETE" && idMatch) {
+        const id = idMatch[1];
+        await ctx.registry.forget(id);
+        ctx.ws.broadcast({ type: "workspace.forgotten", workspace_id: id, timestamp: Date.now() }, id);
         return json(res, 200, { ok: true });
       }
 
-      return err(res, 404, `unknown route: ${method} ${url}`);
+      if (method === "GET" && path === "/resolve") {
+        const cwd = parsed.searchParams.get("cwd");
+        if (!cwd) return err(res, 400, "missing query param: cwd");
+        const routed = await route(cwd, ctx.registry);
+        return json(res, 200, {
+          workspace: routed.workspace,
+          shouldAutoActivate: routed.shouldAutoActivate,
+          root: routed.root,
+        });
+      }
+
+      if (method === "POST" && path === "/hook") {
+        const raw = await readBody(req);
+        const ccPayload = JSON.parse(raw) as unknown;
+        const normalized = normalizeHook(ccPayload);
+        const result = await handleHook(ctx, normalized);
+        if (normalized.event === "UserPromptSubmit") {
+          return json(res, 200, {
+            hookSpecificOutput: { additionalContext: result.additionalContext ?? "" },
+          });
+        }
+        return json(res, 200, {});
+      }
+
+      return err(res, 404, `unknown route: ${method} ${path}`);
     } catch (e) {
       const message = (e as Error).message;
       console.error("[schematic] request error:", e);
@@ -58,7 +124,54 @@ export function createRequestHandler(ctx: DaemonContext): (req: IncomingMessage,
   };
 }
 
-async function handleHook(ctx: DaemonContext, payload: HookPayload): Promise<void> {
+// Translates CC's stdin JSON into our strict HookPayload. Each hook event has
+// its own CC fields; we extract the ones relevant to Schematic's bookkeeping.
+function normalizeHook(raw: unknown): HookPayload {
+  const cc = raw as Record<string, unknown>;
+  const eventName = cc["hook_event_name"] ?? cc["event"];
+  if (eventName !== "PreToolUse" && eventName !== "PostToolUse" && eventName !== "UserPromptSubmit") {
+    throw new Error(`[schematic] unknown hook event: ${String(eventName)}`);
+  }
+  const cwd = cc["cwd"];
+  if (typeof cwd !== "string") throw new Error("[schematic] hook missing cwd");
+  const sessionId = cc["session_id"];
+  if (typeof sessionId !== "string") throw new Error("[schematic] hook missing session_id");
+
+  const toolName = typeof cc["tool_name"] === "string" ? (cc["tool_name"] as string) : null;
+  const toolInput = (cc["tool_input"] as Record<string, unknown> | undefined) ?? undefined;
+  const toolResponse = cc["tool_response"] as Record<string, unknown> | undefined;
+
+  // Target file path extraction — Edit / Write / Read all use `file_path` in tool_input.
+  let target: string | null = null;
+  if (toolInput) {
+    const fp = toolInput["file_path"];
+    if (typeof fp === "string") target = fp;
+  }
+
+  let success: boolean | null = null;
+  if (toolResponse && typeof toolResponse["success"] === "boolean") {
+    success = toolResponse["success"] as boolean;
+  }
+
+  const prompt = typeof cc["prompt"] === "string" ? (cc["prompt"] as string) : null;
+
+  return {
+    event: eventName,
+    tool: toolName,
+    target,
+    cwd,
+    session_id: sessionId,
+    timestamp: Date.now(),
+    success,
+    prompt,
+  };
+}
+
+interface HookResult {
+  additionalContext?: string;
+}
+
+async function handleHook(ctx: DaemonContext, payload: HookPayload): Promise<HookResult> {
   ctx.state.eventCount++;
   const routed = await route(payload.cwd, ctx.registry);
 
@@ -75,17 +188,20 @@ async function handleHook(ctx: DaemonContext, payload: HookPayload): Promise<voi
 
   // If no workspace exists and no marker is present, drop the hook. This is
   // NOT a fallback — it is the designed state machine: hooks from unmarked
-  // cwds are silently ignored until explicit activation (planned for Stage 4
-  // via the CLI or the browser UI's workspace list).
-  if (!workspace) return;
+  // cwds are silently ignored until explicit activation via CLI or UI.
+  if (!workspace) return {};
 
-  if (workspace.state !== "active") return;
+  if (workspace.state !== "active") return {};
 
   await ctx.registry.touch(workspace.id);
   ctx.ws.broadcast(
     { type: "hook.received", workspace_id: workspace.id, payload, timestamp: Date.now() },
     workspace.id,
   );
+
+  // arch-context for UserPromptSubmit — populated in Stage 10. For now the
+  // hook flow is wired end-to-end but the injected context is empty.
+  return {};
 }
 
 // --- tiny response helpers ---

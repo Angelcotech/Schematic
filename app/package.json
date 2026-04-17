@@ -3,10 +3,14 @@
   "version": "0.0.1",
   "private": true,
   "type": "module",
+  "bin": {
+    "schematic": "./dist/cli/index.js"
+  },
   "scripts": {
     "typecheck": "tsc --noEmit",
     "build": "tsc",
-    "daemon": "node dist/daemon/bin.js"
+    "daemon": "node dist/daemon/bin.js",
+    "cli": "node dist/cli/index.js"
   },
   "dependencies": {
     "ws": "^8.18.0"
