@@ -127,6 +127,31 @@ export class WorkspaceNodeStore {
     return this.nodes.get(id);
   }
 
+  // Apply a batch of manual position updates. Flags each touched node as
+  // manually_positioned so subsequent re-extractions preserve it per
+  // Invariant #6 ("user-positioned nodes are sacred").
+  applyPositions(positions: Array<{ node_id: string; x: number; y: number; width?: number; height?: number }>): void {
+    for (const p of positions) {
+      const node = this.nodes.get(p.node_id);
+      if (!node) continue;
+      node.x = p.x;
+      node.y = p.y;
+      if (p.width !== undefined) node.width = p.width;
+      if (p.height !== undefined) node.height = p.height;
+      node.manually_positioned = true;
+      node.last_user_touch = Date.now();
+    }
+  }
+
+  // Clear all `manually_positioned` flags — invoked by the re-layout
+  // action so the next extraction produces fresh grid positions.
+  clearManualPositions(): void {
+    for (const node of this.nodes.values()) {
+      node.manually_positioned = false;
+      node.manually_sized = false;
+    }
+  }
+
   // Replace the graph with freshly-extracted data, preserving the
   // hot/ephemeral state (ai_intent, user_state, mentions) that bootstrap
   // hooks and user clicks have already accumulated.

@@ -12,6 +12,12 @@ import type { Workspace } from "../shared/workspace.js";
 import type { WorkspaceRegistry } from "./workspaces/registry.js";
 import type { WSBroadcaster } from "./ws.js";
 import { newWorkspace, route } from "./workspaces/router.js";
+import { deleteCache } from "./cache/graph-cache.js";
+import {
+  deletePositions,
+  readPositions,
+  writePositions,
+} from "./cache/positions.js";
 import type { NodeStoreRegistry } from "./node-store.js";
 import type { ActivationManager } from "./workspaces/activate.js";
 
@@ -137,6 +143,54 @@ export function createRequestHandler(
           nodes: store?.all() ?? [],
           edges: store?.edges() ?? [],
         });
+      }
+
+      // /workspaces/:id/positions — POST { positions: [...] }
+      // Applies manual drag results, marks nodes as manually_positioned,
+      // and writes to positions.json so they survive daemon restart and
+      // re-extractions (per Invariant #6).
+      const positionsMatch = /^\/workspaces\/([^/]+)\/positions$/.exec(path);
+      if (method === "POST" && positionsMatch) {
+        const id = positionsMatch[1];
+        const store = ctx.nodeStores.get(id);
+        if (!store) return err(res, 404, "unknown workspace");
+        const body = JSON.parse(await readBody(req)) as {
+          positions: Array<{ node_id: string; x: number; y: number; width?: number; height?: number }>;
+        };
+        store.applyPositions(body.positions);
+
+        // Merge with existing persisted overrides so a drag on one module
+        // doesn't wipe another's previously-saved position.
+        const existing = await readPositions(id);
+        for (const p of body.positions) {
+          const entry: { x: number; y: number; width?: number; height?: number } = {
+            x: p.x,
+            y: p.y,
+          };
+          if (p.width !== undefined) entry.width = p.width;
+          if (p.height !== undefined) entry.height = p.height;
+          existing[p.node_id] = entry;
+        }
+        await writePositions(id, existing);
+
+        return json(res, 200, { ok: true, updated: body.positions.length });
+      }
+
+      // /workspaces/:id/relayout — POST, wipes manual positions and triggers
+      // a fresh extraction. The gate modal is a frontend concern; by the time
+      // this endpoint is hit, the user has already confirmed.
+      const relayoutMatch = /^\/workspaces\/([^/]+)\/relayout$/.exec(path);
+      if (method === "POST" && relayoutMatch) {
+        const id = relayoutMatch[1];
+        const workspace = ctx.registry.get(id);
+        if (!workspace) return err(res, 404, "unknown workspace");
+        const store = ctx.nodeStores.get(id);
+        store?.clearManualPositions();
+        await deleteCache(id);
+        await deletePositions(id);
+        await ctx.activations.deactivate(id);
+        void ctx.activations.activate(workspace);
+        return json(res, 200, { ok: true });
       }
 
       if (method === "GET" && path === "/resolve") {

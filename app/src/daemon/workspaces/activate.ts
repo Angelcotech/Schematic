@@ -14,7 +14,9 @@ import {
   writeCache,
   type CachedGraph,
 } from "../cache/graph-cache.js";
+import { readPositions, type PositionsMap } from "../cache/positions.js";
 import { startWatcher, type FsChangeBatch } from "../fs-watch/watcher.js";
+import type { NodeState } from "../../shared/node-state.js";
 
 interface ActiveHandle {
   workspaceId: string;
@@ -69,6 +71,7 @@ export class ActivationManager {
   private async runExtraction(workspace: Workspace): Promise<void> {
     const hashes = await configHashes(workspace.root);
     const cached = await readCache(workspace.id);
+    const positions = await readPositions(workspace.id);
 
     if (
       cached &&
@@ -79,7 +82,8 @@ export class ActivationManager {
       // Cache hit: restore nodes + edges. Dirty-file diffing is a later
       // optimization; for v1 we trust the cache when config is unchanged.
       const store = this.stores.getOrCreate(workspace.id);
-      store.applyExtractedGraph(cached.nodes, cached.edges);
+      const withPositions = applyPositions(cached.nodes, positions);
+      store.applyExtractedGraph(withPositions, cached.edges);
       this.emitReady(workspace.id, cached.nodes.length, cached.edges.length);
       return;
     }
@@ -97,7 +101,8 @@ export class ActivationManager {
     });
 
     const store = this.stores.getOrCreate(workspace.id);
-    store.applyExtractedGraph(graph.nodes, graph.edges);
+    const withPositions = applyPositions(graph.nodes, positions);
+    store.applyExtractedGraph(withPositions, graph.edges);
 
     const persisted: CachedGraph = {
       schema_version: 1,
@@ -107,7 +112,7 @@ export class ActivationManager {
       package_json_hash: hashes.package_json_hash,
       schematic_json_hash: hashes.schematic_json_hash,
       files: Object.fromEntries(graph.fileStats),
-      nodes: graph.nodes,
+      nodes: graph.nodes, // freshly extracted (no manual overrides yet)
       edges: graph.edges,
     };
     await writeCache(persisted);
@@ -138,4 +143,22 @@ export class ActivationManager {
       timestamp: Date.now(),
     });
   }
+}
+
+// Apply stored manual overrides to freshly-extracted / cached nodes.
+// Nodes present in `positions` get their x/y/w/h from disk and are marked
+// manually_positioned so downstream code respects them.
+function applyPositions(nodes: NodeState[], positions: PositionsMap): NodeState[] {
+  return nodes.map((n) => {
+    const override = positions[n.id];
+    if (!override) return n;
+    return {
+      ...n,
+      x: override.x,
+      y: override.y,
+      width: override.width ?? n.width,
+      height: override.height ?? n.height,
+      manually_positioned: true,
+    };
+  });
 }

@@ -207,4 +207,30 @@ Also noted: imports.ts comment mentions "retry with TS source extensions" — de
 
 ---
 
+## Stage 7 scan
+
+**Date:** 2026-04-17
+**Scope:** `cache/positions.ts` (new), `cache/graph-cache.ts` (deleteCache added), `node-store.ts` (applyPositions + clearManualPositions), `http.ts` (positions + relayout endpoints), `workspaces/activate.ts` (applies positions after extract/cache), frontend `main.ts` (drag state, push-apart, persistence).
+
+**Commands used:**
+```
+rg 'catch\s*[\({]|try\s*\{|fallback|retry' app/src/daemon/cache/positions.ts app/src/daemon/cache/graph-cache.ts frontend/src/main.ts
+```
+
+**Findings:**
+
+| Location | Pattern | Decision |
+|----------|---------|----------|
+| `cache/positions.ts:25-28` | `readPositions` try/catch | **Justified.** ENOENT → `{}` (no manual drags yet). Other errors → warn + empty. Mirrors `readCache`. |
+| `cache/positions.ts:42-45` | `deletePositions` try/catch | **Justified.** ENOENT → no-op (already absent). Other errors re-thrown. |
+| `cache/graph-cache.ts` `deleteCache` | ENOENT handling | **Justified.** Same pattern as positions delete. |
+| `main.ts` `persistPositions` error log on non-2xx | `console.error(...)` | **Justified.** Background POST from drag-end; failure surfaces in console and the next drag will try again. Not silent. |
+| `workspaces/activate.ts` `applyPositions(nodes, positions)` helper | `override.width ?? n.width` | **Justified.** Optional override property — if a position row omits width/height (common for module-only drags), inherit the extracted dimensions. Parameterization, not a fallback hiding an error. |
+
+No new silent fallbacks. Re-layout clears both cache and positions.json deterministically before re-activation, so the user's wipe intent is complete and observable.
+
+**Outcome:** 0 fallbacks introduced, 5 patterns reviewed and justified.
+
+---
+
 _(future stages appended here)_

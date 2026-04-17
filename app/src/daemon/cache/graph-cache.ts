@@ -66,6 +66,17 @@ export async function readCache(workspaceId: string): Promise<CachedGraph | null
   }
 }
 
+export async function deleteCache(workspaceId: string): Promise<void> {
+  const path = join(workspaceDataDir(workspaceId), "graph.json");
+  try {
+    const { unlink } = await import("node:fs/promises");
+    await unlink(path);
+  } catch (e) {
+    if ((e as NodeJS.ErrnoException).code === "ENOENT") return;
+    throw e;
+  }
+}
+
 export async function writeCache(graph: CachedGraph): Promise<void> {
   const dir = workspaceDataDir(graph.workspace_id);
   await mkdir(WORKSPACES_DIR, { recursive: true });
