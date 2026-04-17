@@ -51,7 +51,7 @@ Stages are sequential by default. Where parallelism is called out, it is intenti
 
 ## Project layout (target)
 
-This is the directory structure Schematic grows into. Not every directory exists at Stage 1 — they come online over time. Referenced paths in later stages assume this layout.
+Two workspaces. Not four. Shared types live in a folder, not a package. Efficiency pass (2026-04-17) collapsed the earlier 4-workspace plan.
 
 ```
 ~/Schematic/
@@ -64,61 +64,63 @@ This is the directory structure Schematic grows into. Not every directory exists
   .gitignore
   .schematic.json               # self-config (dogfood)
   
-  cli/                          # `schematic` CLI binary
+  app/                          # CLI + daemon combined (one package)
     src/
-      index.ts                  # entry
-      commands/
-        install.ts
-        uninstall.ts
-        start.ts / stop.ts / restart.ts / status.ts
-        workspaces.ts
-        config.ts
-        log.ts
-      utils/
-        settings-writer.ts      # safely edits ~/.claude/settings.json
-        port-picker.ts
-    package.json
-    tsconfig.json
-  
-  daemon/                       # background server
-    src/
-      index.ts                  # entry, port bind
-      http.ts                   # /hook, /status, /workspaces, ...
-      ws.ts                     # WebSocket server + broadcast
-      mcp.ts                    # MCP stdio server
-      workspaces/
-        registry.ts             # workspaces.json
-        state-machine.ts        # state transitions
-        router.ts               # cwd → workspace lookup
-      extraction/
-        walker.ts               # directory walk + gitignore
-        imports.ts              # file-level import parser
-        symbols.ts              # TS compiler API symbol extractor
-        call-graph.ts           # symbol-to-symbol edges
-        module-detect.ts        # directory + .schematic.json
-        mention-index.ts        # Aho-Corasick build + serialize
-      cache/
-        graph-cache.ts          # read/write/invalidate
-        atomic-write.ts
-      health/
-        source.ts               # HealthSource interface
-        tsc-runner.ts
-        eslint-runner.ts
-        generic-runner.ts
-        parsers/
-          tsc-json.ts
-          eslint-json.ts
-          pytest-json.ts
-          mypy-json.ts
-        aggregation.ts
-      events/
-        emitter.ts              # typed event bus
-        persist.ts              # events.log rotation
-      fs-watch/
-        watcher.ts              # per-workspace file watcher
-      utils/
-        paths.ts / debounce.ts / hash.ts
-    package.json
+      cli/
+        index.ts                # CLI entry (bin)
+        commands/
+          install.ts / uninstall.ts
+          start.ts / stop.ts / status.ts
+          workspaces.ts
+          config.ts
+          log.ts
+        utils/
+          settings-writer.ts    # safely edits ~/.claude/settings.json
+          port-picker.ts
+      daemon/
+        index.ts                # daemon entry (bind port, start WS)
+        http.ts                 # /hook, /status, /workspaces, ...
+        ws.ts                   # WebSocket server + broadcast
+        mcp.ts                  # MCP stdio server (child process)
+        workspaces/
+          registry.ts           # workspaces.json
+          state-machine.ts      # 3-state transitions
+          router.ts             # cwd → workspace lookup
+          activate.ts           # activation flow
+        extraction/
+          walker.ts             # directory walk + gitignore
+          imports.ts            # file-level import parser
+          symbols.ts            # TS compiler API symbol extractor
+          module-detect.ts      # directory + .schematic.json
+          mention-index.ts      # Aho-Corasick, in-memory only
+        cache/
+          graph-cache.ts        # read/write/invalidate
+          atomic-write.ts
+        health/
+          runner.ts             # single source runner class
+          parsers/
+            tsc.ts
+            eslint.ts
+            pytest-json.ts
+            mypy-json.ts
+          aggregation.ts
+        fs-watch/
+          watcher.ts            # per-workspace file watcher
+        persist/
+          events-log.ts         # append-only log (for CLI tail; no event bus)
+        utils/
+          paths.ts / debounce.ts / hash.ts
+      shared/                   # types imported by both cli/ and daemon/
+        node-state.ts
+        edge.ts
+        event.ts
+        hook-payload.ts
+        workspace.ts
+        health.ts
+        arch-context.ts
+        ws-messages.ts
+        mcp-tools.ts
+    package.json                # bin: { "schematic": "dist/cli/index.js" }
     tsconfig.json
   
   frontend/                     # browser app
@@ -133,7 +135,6 @@ This is the directory structure Schematic grows into. Not every directory exists
         shaders.ts              # rewritten for nodes/edges
         interaction.ts          # direct port
         overlayLayer.ts         # adapted (labels, badges)
-        axes.ts                 # adapted or removed
       graph/
         node-renderer.ts        # rectangle geometry
         edge-renderer.ts        # line geometry
@@ -150,38 +151,30 @@ This is the directory structure Schematic grows into. Not every directory exists
         top-bar.ts              # three status pills
         left-sidebar.ts         # workspaces
         right-sidebar.ts        # diagnostics
-        event-drawer.ts
         welcome-overlay.ts
-        settings.ts
         toast.ts
         context-menu.ts
       workspaces/
         switcher.ts
-    package.json
-    tsconfig.json
-  
-  shared/                       # types shared daemon ↔ frontend
-    src/
-      types/
-        node-state.ts
-        edge.ts
-        event.ts
-        hook-payload.ts
-        workspace.ts
-        health.ts
-        arch-context.ts
-      protocol/
-        ws-messages.ts
-        mcp-tools.ts
+      shared/                   # symlinked/copied from ../app/src/shared
+        ...
     package.json
     tsconfig.json
   
   scripts/
-    strip-gatestack.sh          # one-shot utility for Stage 1
     self-host-check.sh          # runs schematic on its own repo
 ```
 
-This is a monorepo with four workspaces: `cli`, `daemon`, `frontend`, `shared`. Managed via pnpm or bun workspaces (decide in Stage 1). Shared types live in `shared/` so the daemon and frontend can't drift.
+**Two workspaces:** `app` (CLI + daemon in one package, one build), and `frontend`. Shared TypeScript types live in `app/src/shared/` and are re-exported to the frontend via a thin symlink or a postbuild copy step — no separate `shared` package.
+
+**What's NOT here that was in the earlier plan (all cut 2026-04-17):**
+- `cli/` and `daemon/` as separate workspaces — collapsed into `app/`
+- `shared/` as a separate workspace — folder instead
+- `events/emitter.ts` — direct mutation + broadcast, no event bus abstraction
+- `health/tsc-runner.ts`, `eslint-runner.ts`, `generic-runner.ts` — one `runner.ts` + parsers
+- `ui/event-drawer.ts`, `ui/settings.ts` — CLI-only for v1 (`schematic log --tail`, `schematic config`)
+- `mention-index.bin` persistence — in-memory only, rebuild on activation
+- `call-graph.ts` — deferred to Stage 9b
 
 ---
 
@@ -231,22 +224,22 @@ Done as of 2026-04-16:
 
 ### 1.1 — Set up monorepo skeleton
 
-- Decide package manager: **pnpm workspaces** (recommended — widely supported, predictable, no migration story) or bun workspaces (faster but less mature).
-- Create `package.json` at repo root declaring workspaces `["cli", "daemon", "frontend", "shared"]`.
+- Decide package manager: **pnpm workspaces** (recommended — widely supported, predictable).
+- Create `package.json` at repo root declaring workspaces `["app", "frontend"]`. Two, not four.
 - Create `tsconfig.base.json` with strict TypeScript settings; each workspace extends it.
 - Add `.gitignore` entries for `node_modules/`, `dist/`, `.schematic/` (local state).
 - Commit: *"Init monorepo skeleton with pnpm workspaces"*.
 
-### 1.2 — Create `shared/` workspace
+### 1.2 — Define shared types (folder, not package)
 
-- `shared/package.json` with `main: "src/index.ts"`, no runtime deps.
-- `shared/src/index.ts` re-exporting placeholder types.
-- `shared/src/types/node-state.ts` — paste the `NodeState` + `Edge` interfaces from `BUILDING_PLAN.md §3`. These are our source of truth for data shape.
-- Commit: *"Add shared types package with NodeState/Edge from spec"*.
+- Create `app/src/shared/` folder.
+- Paste the `NodeState` + `Edge` interfaces from `BUILDING_PLAN.md §3` into `app/src/shared/node-state.ts` and `app/src/shared/edge.ts`. These are the source of truth for data shape.
+- Frontend will import these via a symlink or postbuild copy (decide in 1.3). A plain relative import works in the monorepo with a tsconfig path mapping.
+- Commit: *"Add shared types (NodeState, Edge) in app/src/shared"*.
 
 ### 1.3 — Create `frontend/` workspace skeleton
 
-- `frontend/package.json` depending on `vite`, `typescript`, `@schematic/shared` (workspace link).
+- `frontend/package.json` depending on `vite`, `typescript`. Shared types via tsconfig `paths` mapping pointing at `../app/src/shared/` — no workspace-package cross-link.
 - `frontend/vite.config.ts` — copy from `~/GateStack-Pro/frontend/vite.config.ts`, change backend proxy URL from `:8002` to `:7777`, drop any Clerk/SaaS-specific vite plugins.
 - `frontend/tsconfig.json`, `tsconfig.app.json`, `tsconfig.node.json` — copy from GateStack-Pro, keep generic parts, extend `tsconfig.base.json`.
 - `frontend/index.html` — minimal, one `<div id="root">`.
@@ -423,11 +416,11 @@ N/A — still no extraction. But the mock graph should use realistic Schematic m
 
 **Estimated effort:** 2–3 days.
 
-### 3.1 — `daemon/` workspace scaffolding
+### 3.1 — `app/` workspace scaffolding
 
-- `daemon/package.json` with deps: `ws` (WebSocket), type definitions, nothing exotic.
-- `daemon/tsconfig.json` extending base, emitting CJS or ESM (pick one — recommend ESM for consistency with frontend).
-- `daemon/src/index.ts` entry: parse port from `~/.schematic/config.json`, bind HTTP server, start WebSocket server on the same port via upgrade.
+- `app/package.json` with deps: `ws` (WebSocket), `commander` (CLI), type definitions. Declares two bin entries later: the CLI and the daemon.
+- `app/tsconfig.json` extending base, emitting ESM for consistency.
+- `app/src/daemon/index.ts` entry: parse port from `~/.schematic/config.json`, bind HTTP server, start WebSocket server on the same port via upgrade.
 
 ### 3.2 — HTTP layer
 
@@ -453,39 +446,46 @@ type WSMessage =
 
 ### 3.4 — Workspace registry
 
-`daemon/src/workspaces/registry.ts`:
+`app/src/daemon/workspaces/registry.ts`:
 - Reads `~/.schematic/workspaces.json` on startup (creates if missing)
-- Exposes `register(path)`, `activate(id)`, `pause(id)`, `disable(id)`, `forget(id)`, `get(id)`, `findByPath(cwd)`
+- Exposes `activate(path)`, `pause(id)`, `resume(id)`, `disable(id)`, `forget(id)`, `get(id)`, `findByPath(cwd)`
 - Persists atomically (write tmp, rename)
+- **Three states only:** `active`, `paused`, `disabled`. No record = pre-activation.
 
-`daemon/src/workspaces/state-machine.ts` enforces legal transitions from §7 of BUILDING_PLAN.
+`app/src/daemon/workspaces/state-machine.ts` enforces legal transitions per BUILDING_PLAN §7.
 
 ### 3.5 — cwd-based routing
 
-`daemon/src/workspaces/router.ts`: given a `cwd`, walk up the filesystem looking for `.git`, `.schematic.json`, `.schematic/`, or a path matching an existing workspace. Return the workspace ID or register a new one.
+`app/src/daemon/workspaces/router.ts`: given a `cwd`, walk up the filesystem looking for `.git`, `.schematic.json`, `.schematic/`, or a path matching an existing workspace. Return the workspace ID, or return `null` if the path has no record and no auto-activation marker.
 
-Used by `POST /hook` to tag every hook with `workspace_id`.
+A `null` return from routing is not an error — it means "new cwd, no marker, don't create a record yet; emit a one-time toast instead and wait for explicit activation."
 
 ### 3.6 — Persistence layout
 
 On daemon startup, ensure:
 - `~/.schematic/` exists
-- `~/.schematic/config.json` exists (default port, toast policy, ignored paths)
+- `~/.schematic/config.json` exists (default port, ignored paths)
 - `~/.schematic/workspaces.json` exists (empty array OK)
 - `~/.schematic/workspaces/` exists
 
-### 3.7 — Events emitter
+### 3.7 — State broadcasting (no event emitter abstraction)
 
-`daemon/src/events/emitter.ts` — typed event bus. Events are broadcast to WebSocket clients and (future) persisted to `events.log`.
+**No event-bus class.** State mutations call three things directly:
+1. Update in-memory workspace state
+2. Call `ws.broadcast(message)` to push to WS clients
+3. Enqueue a persist (debounced write to events-log for `schematic log --tail`)
 
-Stage 3 events: `workspace.registered`, `workspace.activated`, `workspace.paused`, `workspace.disabled`, `workspace.forgotten`.
+A tiny `broadcast(ev)` helper in the daemon inlines all three. No pub/sub, no typed event registry, no listener list.
+
+Events that broadcast in Stage 3: `workspace.activated`, `workspace.paused`, `workspace.disabled`, `workspace.forgotten`.
 
 ### 3.8 — CLI-less smoke test
 
-Add `daemon/src/bin.ts` that spawns the daemon directly (pre-CLI). Run `pnpm --filter @schematic/daemon start`. Confirm:
+Add `app/src/daemon/bin.ts` that spawns the daemon directly (pre-CLI). Run `pnpm --filter @schematic/app daemon`. Confirm:
 - Port 7777 binds (or fallback if taken)
 - `curl http://localhost:7777/status` returns JSON
-- `curl -X POST http://localhost:7777/hook -d '{"event":"PreToolUse","cwd":"/tmp/test","session_id":"abc"}'` returns 200, logs the payload, creates a workspace entry
+- `curl -X POST http://localhost:7777/hook -d '{"event":"PreToolUse","cwd":"/tmp/marked-repo","session_id":"abc"}'` with a marker file present → 200, creates workspace as `active`
+- Same POST without a marker → 200, no record created, one-time toast broadcast only
 
 ### Gate criteria — Stage 3
 
@@ -697,18 +697,17 @@ When you work on Schematic itself with CC, your edits appear on Schematic's own 
 - For each file, walk the AST, emit exported symbols (functions, classes, interfaces, types, constants)
 - For each symbol: `signature`, `symbol_kind`, `parent` (= file ID), `depth` = file depth + 1
 
-### 6.5 — Call-graph extractor
+### 6.5 — (Deferred: call-graph extractor moved to Stage 9b)
 
-`daemon/src/extraction/call-graph.ts`:
-- TS compiler API `getReferencedSymbols` / `findReferences` to build caller→callee edges between exported symbols
-- Emit as `Edge` with `kind: "calls"`
+Symbols extracted here become nodes. Call edges between symbols are deferred — they require `findReferences` across every exported symbol (potentially N² without careful indexing) and can add ~30 seconds to extraction. Not in the critical v1 path. Stage 9b handles it.
 
-### 6.6 — Mention index
+### 6.6 — Mention index (in memory only)
 
-`daemon/src/extraction/mention-index.ts`:
+`app/src/daemon/extraction/mention-index.ts`:
 - Collect all identifiers: file paths, basenames, module names, symbol names
-- Build Aho-Corasick automaton
-- Serialize to `mention-index.bin` (use a library: `ahocorasick` or similar)
+- Build Aho-Corasick automaton (use `ahocorasick` or similar library)
+- Hold in memory on the workspace object
+- **Do not serialize to disk.** Rebuild on activation (~100ms for 20k identifiers). Incremental update on node add/remove.
 
 ### 6.7 — Cache layer
 
@@ -902,46 +901,78 @@ Zoom out on Schematic. Should see exactly 4 modules (CLI, Daemon, Frontend, Shar
 
 ---
 
-## Stage 9 — Tier-3 symbol rendering
+## Stage 9 — Tier-3 symbol rendering (no call edges yet)
 
-**Goal:** Zooming past 80% reveals individual symbols (functions, classes, types) inside files, with call edges between them. Data is already in the cache from Stage 6 — this stage is rendering only.
+**Goal:** Zooming past 80% reveals individual symbols (functions, classes, types) inside files. Symbol data is already in the cache from Stage 6 — this stage is rendering only. Call edges come in Stage 9b.
 
-**Unlocks:** Stage 10 (symbol-level MCP queries).
+**Unlocks:** Stage 10 (symbol-level MCP queries), Stage 9b (call graph).
 
 **Dependencies:** Stages 6, 8.
 
-**Estimated effort:** 2–3 days.
+**Estimated effort:** 1–2 days.
 
 ### 9.1 — Symbol node rendering
 
 Symbol nodes are small rectangles (or rounded pills) arranged inside their parent file's bounds. Use a compact vertical stack with signature as label.
 
-### 9.2 — Call edges
-
-Render call edges as thin lines between symbols. At tier 2, aggregated to file-level; at tier 3, individual.
-
-### 9.3 — Symbol interactions
+### 9.2 — Symbol interactions
 
 Hover a symbol → tooltip shows `signature`. Click → select, diagnostics sidebar updates (if tier-3 diagnostics exist).
 
-### 9.4 — Symbol-level hit testing
+### 9.3 — Symbol-level hit testing
 
 Extend the hit-test to symbols when at tier 3 zoom.
 
-### 9.5 — Symbol search
+### 9.4 — Symbol search
 
 Add a search input (floating over the canvas). Typing `extractFeatures` shows autocomplete matching symbols, click → camera zooms to and selects that symbol.
 
 ### Gate criteria — Stage 9
 
-- [ ] Zoom into `daemon/src/extraction/symbols.ts` → individual functions and classes visible
-- [ ] Call edges show `extractSymbols()` calling `walkAst()` (or whatever the actual structure is)
+- [ ] Zoom into `app/src/daemon/extraction/symbols.ts` → individual functions and classes visible as nodes
+- [ ] Hover and click work at symbol granularity
 - [ ] Search for a known symbol name → camera jumps to it
 - [ ] 60fps maintained at tier 3 on Schematic's own codebase
 
 ### Self-hosting check — Stage 9
 
-Navigate to a specific function in Schematic. Click it. Verify it's correctly identified, signature matches source, call edges match actual callers.
+Navigate to a specific function in Schematic. Click it. Verify it's correctly identified, signature matches source. Call edges are absent — Stage 9b.
+
+---
+
+## Stage 9b — Call-graph extraction + rendering (post-v1 if scope pressure)
+
+**Goal:** Add caller→callee edges between symbols. Unlocks "show me what calls this function" visually.
+
+**Dependencies:** Stage 9.
+
+**Estimated effort:** 2–3 days.
+
+### 9b.1 — Call-graph extractor
+
+`app/src/daemon/extraction/call-graph.ts`:
+- TS compiler API `findReferences` on exported symbols
+- Build caller→callee edges
+- Incremental: only re-run on changed files via the cache-invalidation path
+
+### 9b.2 — Call-edge rendering
+
+- Thin lines between symbols at tier 3
+- Aggregated to file-level at tier 2 (aggregation reuses Stage 8's edge-aggregation code)
+- Distinct style from import edges (different color / dash pattern)
+
+### 9b.3 — MCP `arch_neighbors` extended
+
+At symbol granularity, `arch_neighbors(symbol)` returns callers + callees, not just imports.
+
+### Gate criteria — Stage 9b
+
+- [ ] On Schematic's own graph, `extractSymbols()` shows edges to its callers
+- [ ] Extraction time increase is bounded (target: +30 seconds on a 3k-file repo)
+
+### When to do this
+
+Only pull 9b into v1 if dogfooding proves it's needed. Ship v1 without it; see if absence is felt.
 
 ---
 
@@ -957,13 +988,16 @@ Navigate to a specific function in Schematic. Click it. Verify it's correctly id
 
 ### 10.1 — MCP server
 
-`daemon/src/mcp.ts`:
+`app/src/daemon/mcp.ts`:
 - Stdio transport as a child process of CC (per MCP spec)
-- Tools: `arch_neighbors`, `arch_impact`, `arch_find`, `arch_get_selection`, `arch_health` (stub for now, wired fully in Stage 11)
+- The MCP child is a thin proxy: every tool call HTTP-requests the running daemon and returns the response
+- Two tools ship: `arch_neighbors` and `arch_health` (stub for now; wired fully in Stage 11)
 
 ### 10.2 — MCP tool implementations
 
-Each tool resolves against the currently-active workspace (inferred from the cwd the MCP process was spawned with, or the most-recently-active workspace).
+Each tool resolves against the workspace matching the cwd the MCP process was spawned with.
+
+`arch_get_selection`, `arch_find`, `arch_impact` are NOT in v1. Selection is already in `<arch-context>`. Find duplicates Grep/Glob. Impact is `arch_neighbors` walked. Add them only if dogfood proves they'd help.
 
 ### 10.3 — arch-context builder
 
@@ -1016,32 +1050,21 @@ Use Schematic on Schematic. Click a daemon file, ask CC to refactor it. Confirm 
 
 **Estimated effort:** 4–5 days.
 
-### 11.1 — HealthSource interface
+### 11.1 — Single runner class
 
-`daemon/src/health/source.ts`:
-```ts
-interface HealthSource {
-  start(workspace: Workspace): Promise<void>;
-  stop(): Promise<void>;
-  onDiagnostics(cb: (diagnostics: Diagnostic[]) => void): void;
-}
-```
+`app/src/daemon/health/runner.ts`:
+- Spawns an arbitrary shell command in watch mode
+- Pipes stdout through a named parser (looked up by string key)
+- Manages lifecycle: start, stop, auto-restart on crash with exponential backoff
+- Emits `Diagnostic[]` via callback
 
-### 11.2 — tsc-watch runner
+One class. No `tsc-runner`, `eslint-runner`, `generic-runner` as separate classes — those differences live in the parsers.
 
-Spawn `tsc --watch --noEmit` (or `tsc -b -w`) with JSON diagnostic output. Parse stream, emit `Diagnostic[]`. Auto-restart on crash (exponential backoff).
+### 11.2 — Built-in parsers
 
-### 11.3 — eslint runner
+`app/src/daemon/health/parsers/`: `tsc.ts`, `eslint.ts`, `pytest-json.ts`, `mypy-json.ts`. Each takes raw stdout lines and emits `Diagnostic[]` with normalized repo-relative paths.
 
-`eslint --watch` or custom loop with file-watcher. Parse JSON output.
-
-### 11.4 — Generic command runner
-
-`daemon/src/health/generic-runner.ts`: spawns an arbitrary shell command, pipes output through a named parser (pytest-json, mypy-json, etc.).
-
-### 11.5 — Built-in parsers
-
-`tsc-json.ts`, `eslint-json.ts`, `pytest-json.ts`, `mypy-json.ts` — each maps tool output to `Diagnostic`.
+Each parser is a plain function: `(chunk: string) => Diagnostic[]`. No class hierarchy.
 
 ### 11.6 — Diagnostic → node mapping
 
@@ -1106,21 +1129,27 @@ List view with state indicator, recent activity timestamp, health summary. Click
 
 Already partially built in Stage 11; polish formatting, grouping, keyboard nav.
 
-### 12.4 — Bottom drawer: event feed
+### 12.4 — Event feed: CLI only in v1
 
-Toggled with backtick. Streams events with filtering (by workspace, session, event type). Retention capped at 10,000 in memory, rotating to `events.log`.
+**Not a GUI drawer.** `schematic log --tail` streams events in the user's terminal. The drawer was deferred by the 2026-04-17 efficiency pass — a solo user debugging is already in a terminal. Add GUI drawer in v1.5 only if real demand surfaces.
 
 ### 12.5 — Welcome overlay
 
-First-visit overlay per BUILDING_PLAN §10.5. Dismissed state persists.
+First-visit overlay per BUILDING_PLAN §10.5. Dismissed state persists in `~/.schematic/config.json`.
 
 ### 12.6 — Toast system
 
-Policy engine driven by `~/.schematic/config.json`: first-time / once-per-day / silent / always. Per-path skip.
+Opinionated, not configurable in v1.
 
-### 12.7 — Settings panel
+- First-time cwd without a marker → toast with [Activate] [Skip] [Always skip this path]
+- Auto-activation on marker → one-line "GammaGate auto-activated"
+- Errors → red sticky toast
 
-Gear icon → form for port, toast cadence, event retention, theme, ignored paths, debug log level. Persist to config.
+No cadence setting. No policy panel. One behavior, tuned sensibly. See BUILDING_PLAN §10.4.
+
+### 12.7 — Settings: CLI only in v1
+
+**No GUI panel.** `schematic config get <key>` / `set <key> <value>`. Opinionated defaults work out of the box; advanced users run a CLI command. Panel is v1.5.
 
 ### 12.8 — Keyboard navigation
 
@@ -1197,10 +1226,46 @@ A proper README, quickstart, FAQ. Website? Only if distributing broadly.
 
 ---
 
+## Workflow considerations
+
+### Terminal-to-map switching
+
+A real v1 UX concern: users type in a CC terminal, watch Schematic in a browser tab. On a single monitor, constant alt-tab. On dual monitor, constant eye movement.
+
+**What already reduces this in the design:**
+- `<arch-context>` injection means the user rarely has to *type* node references. They click a node, type "fix it" — CC knows what "it" is.
+- The three-pill status bar makes state legible at a peripheral glance — no close inspection needed.
+- Diagnostics appear on the map continuously, so the user doesn't run `tsc` manually.
+
+**What is NOT in v1 but could be added later:**
+- **Embedded xterm.js terminal inside Schematic** (v1.5 candidate): a browser-embedded terminal running the user's actual shell. CC runs there. Map and terminal in one window. Requires a PTY bridge through the daemon. Defer until dogfood proves the friction is real.
+- **Chrome extension always-on-top popup** (already in Stage 13): minor help for single-monitor users.
+- **Click-to-clipboard node references**: low-effort, arguably useful when user wants to reference a node in prose ("implement something like parser.ts's error handling"). Add if noticed-needed.
+
+**v1 stance:** assume dual-monitor workflow. Keep `<arch-context>` rich so typing is minimized. Ship. If dogfood proves the terminal switch costs real attention, pull xterm.js into v1.5 as priority-one.
+
+### What was cut (2026-04-17 efficiency pass)
+
+Applied 8 simplifications before writing any code. Each cut zero user-visible features:
+
+1. **4 workspaces → 2** (`app` + `frontend`; shared types via folder not package)
+2. **Event-emitter abstraction → direct mutation + broadcast**
+3. **Aho-Corasick index serialization → in-memory only**
+4. **3 health-runner classes → 1 runner + named parsers**
+5. **5 workspace states → 3** (`active`, `paused`, `disabled`)
+6. **5 MCP tools → 2** (`arch_neighbors`, `arch_health`)
+7. **GUI settings panel → CLI only**
+8. **GUI event drawer → CLI only** (`schematic log --tail`)
+
+Additionally, **call-graph extraction split out of Stage 6 into Stage 9b** — symbols first-class, call edges later if needed.
+
+Design principle adopted: **curated smooth, no options.** Single opinionated path, not a tree of toggles. Users don't miss features that don't exist.
+
 ## Global reminders
 
 - **Small commits.** Each sub-step ends with a reviewable commit. Not batched.
 - **Surgery model.** Diff reviewed before applying. Especially Stage 1 where we are porting living code.
 - **Dogfood.** From Stage 6, if Schematic can't usefully visualize itself, don't move on.
 - **No backward-compat shims.** This is v1. If it breaks, we change it. No deprecation paths yet.
-- **Respect the invariants.** All nine from BUILDING_PLAN §15. Especially #1 (CC never has to remember), #6 (user positions are sacred), #9 (visibility).
+- **No options.** If you're about to add a settings toggle, stop. Pick the default.
+- **Respect the invariants.** All nine from BUILDING_PLAN §15.

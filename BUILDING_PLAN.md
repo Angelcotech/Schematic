@@ -278,12 +278,13 @@ The daemon augments the payload with `workspace_id` after cwd-routing.
 
 **2. MCP server — read-side, on-demand**
 
-- `arch_neighbors(node)` — what imports/depends on this
-- `arch_impact(node)` — blast radius of changing it
-- `arch_find(query)` — fuzzy locate a component
-- `arch_get_selection()` — currently selected node IDs
+Two tools ship in v1:
+- `arch_neighbors(node)` — what imports/depends on this (recursive callers can be traced by walking it)
 - `arch_health(node)` — diagnostics for the node (errors, warnings)
-- Layer-aware: queries resolve at the granularity of the node ID passed (module vs. file vs. symbol).
+
+`arch_get_selection` is redundant with `<arch-context>` injection (selection is already in every prompt). `arch_find` duplicates CC's Grep/Glob. `arch_impact` is `arch_neighbors` walked. All three deferred — add only if real demand appears.
+
+Tools are layer-aware: queries resolve at the granularity of the node ID passed (module vs. file vs. symbol).
 
 **3. UserPromptSubmit hook — read-side, automatic context injection**
 
@@ -343,21 +344,22 @@ Daemon applies, computes state delta, broadcasts to all clients. Gives you a fre
 
 ### State machine
 
+Three states. Pre-activation, a workspace simply does not exist in the registry.
+
 | State | Meaning | Hooks applied? | `<arch-context>` injected? |
 |-------|---------|---------------|-----------------|
-| `unknown` | Never seen this cwd | — | — |
-| `registered` | Path seen, no processing | No | No |
 | `active` | Full treatment: graph, health, state | Yes | Yes |
 | `paused` | Was active, user paused | No | No (graph cache kept) |
 | `disabled` | Opt-out marker present | No | No |
 
 Transitions:
-- `unknown → registered` — auto, on first hook call from a new cwd
-- `registered → active` — auto if `.schematic.json` or `.schematic/` present; otherwise manual via UI or `schematic activate`
+- No record → `active` — first hook from a cwd with `.schematic.json` / `.schematic/` auto-activates; otherwise daemon emits a one-time toast and waits for manual activation (`schematic activate` or UI click), which creates the record as `active`.
 - `active ↔ paused` — manual via UI or CLI
 - any → `disabled` — via `.schematic-ignore` or global config
-- `disabled → registered` — remove `.schematic-ignore` or global config entry, then manual
-- any → `forgotten` — user explicitly removes from registry; workspace persistence directory deleted (or layout-only retained if opted)
+- `disabled → paused` — remove `.schematic-ignore` or global config entry; remains paused until user resumes
+- any → forgotten — user explicitly removes from registry; workspace persistence directory deleted
+
+The old `unknown` and `registered` states collapsed: a workspace without a record is pre-activation, with no behavioral difference. Eliminating them simplifies the UI (no "grey" workspace pill state), the toast policy, and the state-transition matrix.
 
 ### Activation paths
 
@@ -515,9 +517,11 @@ Broadcast via WS + arch_health via MCP
 
 ### What ships in v1
 
-**First-class source: `tsc --watch`.** TypeScript's daemon mode emits JSON diagnostics. Schematic launches and manages the tsc process, streams its output, maps diagnostics to file and symbol nodes. David's primary language — integration has to be first-class from day one.
+**One runner class, multiple parsers.** A single `HealthSourceRunner` spawns any shell command in watch mode and pipes output through a named parser. v1 ships with four built-in parsers (`tsc`, `eslint`, `pytest-json`, `mypy-json`). Adding a fifth later is a new parser, not a new runner class.
 
-**Generic command runner.** For any other tool, users declare a shell command plus an output parser in `.schematic.json`:
+TypeScript gets first-class treatment via the `tsc` parser — `tsc --watch` emits JSON diagnostics the parser consumes. The runner itself is the same as for any other tool. No separate "tsc-runner" class.
+
+Users declare sources in `.schematic.json`:
 
 ```json
 {
@@ -674,18 +678,21 @@ Click-through on any pill opens a detailed status panel. If something is wrong, 
 
 - **Left sidebar — Workspaces.** List of all registered workspaces with state indicator, recent activity timestamp, health summary. Right-click → context menu (see §7). Click → switch view to that workspace.
 - **Right sidebar — Diagnostics.** Active when a node or module with issues is focused. Lists errors/warnings grouped by file, with source attribution and line numbers. Future: click to jump in editor.
-- **Bottom drawer — Event feed.** Toggled with backtick key. Streams every hook, context injection, and health update in real time. Filterable by workspace, session, event type. Retention capped at 10,000 entries in memory; older entries rotate to `events.log` on disk.
+- **Event feed — CLI only in v1.** `schematic log --tail` streams events in the user's terminal. No GUI drawer. The drawer was a planned Stage-12 feature; it's deferred. A CLI tail is adequate for debugging and actually plays better with the terminal-based workflow CC lives in.
 - **Top bar** — three status pills (see §10.2), workspace switcher, re-layout button, settings gear.
 
 All sidebars and the drawer are collapsible and start closed on first launch.
 
 ### 10.4 Toast policy
 
-- **First time a new workspace registers:** toast with [Activate] [Skip for now] [Always skip this path].
-- **"Always skip this path":** writes path to global config's ignore list → future visits auto-disable silently.
-- **Subsequent registrations after the first:** toast shows once per day by default; configurable to silent or always in settings.
-- **Workspace state transitions:** amber-subtle toast ("GammaGate auto-activated") with [Switch] [Keep viewing current].
-- **Errors:** red toast, sticky until dismissed (e.g., "tsc-watch crashed — restarting").
+Opinionated, not configurable in v1.
+
+- **First time a cwd without a marker is detected:** toast with [Activate] [Skip] [Always skip this path]. After that first toast per path, the same path is silent — subsequent CC sessions in the same repo do not re-prompt.
+- **"Always skip this path":** writes the path to global config's ignore list → future visits are silent no-ops.
+- **Workspace auto-activation on marker:** subtle one-line toast ("GammaGate auto-activated") with [Switch] [Keep viewing current].
+- **Errors:** red toast, sticky until dismissed (e.g., "tsc crashed — restarting").
+
+No "toast cadence" setting. No "toast policy" panel. One behavior, tuned sensibly.
 
 ### 10.5 Welcome overlay
 
@@ -701,23 +708,22 @@ First-ever browser visit shows a centered overlay:
 
 Dismissed state persists to `~/.schematic/config.json`. Not shown again unless explicitly reset via `schematic config set welcome.shown false`.
 
-### 10.6 Settings panel
+### 10.6 No GUI settings panel in v1
 
-Accessible via gear icon in top bar. Editable:
-- Port (requires daemon restart)
-- Toast cadence (first-only / once-per-day / always / silent)
-- Event feed retention cap
-- Theme (dark default; light planned)
-- Ignored path patterns
-- Health source defaults (can be overridden per-workspace by `.schematic.json`)
-- Debug log level
+v1 ships with opinionated defaults and no settings panel. The rarely-edited knobs (port, ignored paths, theme) are CLI-only:
 
-Settings persist to `~/.schematic/config.json`.
+```
+schematic config get <key>
+schematic config set <key> <value>
+```
+
+Settings still persist to `~/.schematic/config.json`, just edited via CLI rather than a GUI form. A settings panel is a v1.5 candidate — not missed by v1 users because the defaults are the right path.
 
 ---
 
 ## 11. Tech Stack (proposed)
 
+- **Repo layout:** monorepo with **two** workspaces — `app` (CLI + daemon combined) and `frontend`. Shared types live in a plain `app/src/shared/` folder imported relatively. No separate `shared` package, no separate `cli` package.
 - **Frontend:** Vite + TypeScript, port of GateStack Pro's WebGL framework
 - **Server:** Node (or Bun) + WebSocket + HTTP; single multi-tenant daemon, fixed port 7777 (fallback auto-assigned), local-only
 - **Graph source:**
@@ -729,7 +735,7 @@ Settings persist to `~/.schematic/config.json`.
   - Manual overrides locked via `manually_positioned`
   - Collision: force-directed push-apart at rest; live iterative displacement during drag
 - **Health sources:** built-in `tsc --watch` runner (JSON diagnostics), built-in ESLint runner, generic command runner for user-defined tools; parsers: `tsc`, `eslint`, `pytest-json`, `mypy-json`
-- **Mention index:** Aho-Corasick automaton built at graph-build time, updated incrementally on node add/remove, serialized to `mention-index.bin` per workspace
+- **Mention index:** Aho-Corasick automaton built in memory at workspace activation (~100ms on 20k identifiers). Updated incrementally on node add/remove. Not persisted — rebuild is cheaper than the disk round trip.
 - **Persistence:** flat JSON under `~/.schematic/workspaces/<id>/` — node positions, graph cache, event log, health cache, mention index
 - **Hook integration:** shell scripts in the user's **global** Claude Code settings that POST to `localhost:7777/hook` with cwd + session_id-tagged payloads
 - **MCP server:** stdio transport, registered **once globally** in Claude Code settings
@@ -777,6 +783,7 @@ Remaining:
 - [ ] **Editor jump integration:** side panel "jump to line" behavior. VS Code URL scheme? Configurable editor hook?
 - [ ] **Multi-session concurrency semantics:** if two CC sessions edit the same file concurrently, how do we render competing `ai_intent_session` states? Leaning: union of halos, tooltip shows session list.
 - [ ] **Tiered readiness threshold (v2):** at what file count do we switch from single-pass eager extraction to tier-0-2-first-then-tier-3-background? (Gut: 5,000 files.)
+- [ ] **Terminal-to-map switching friction:** for single-monitor users, constantly alt-tabbing between CC terminal and Schematic browser is real cognitive cost. `<arch-context>` injection already eliminates the "type the filename" friction — user clicks a node, says "fix it," CC knows what "it" is. But the eye-switching remains. Options: (a) Chrome extension always-on-top popup (planned Stage 13), (b) embedded xterm.js terminal inside Schematic running the user's actual shell (v1.5 candidate if dogfooding proves friction is real), (c) deliberate second-monitor workflow documentation. For v1, assume dual-monitor, keep `<arch-context>` rich, revisit after dogfood.
 
 ---
 
@@ -916,3 +923,17 @@ These must remain true no matter how the design evolves:
 - **2026-04-16 (cont.)** — Development strategy decided: **Schematic is its own primary test target.** From Phase 4 (graph extraction) onward, every phase is validated against the Schematic repo itself. Self-hosting is the test suite. If Schematic can't usefully visualize Schematic, it can't ship.
 
 - **2026-04-16 (cont.)** — Extraction strategy flipped from lazy to **eager + cache**. Original "lazy symbol extraction on zoom" was premature optimization. New model: full graph (files + imports + symbols + call edges) extracted in one pass at first activation (~1–3 minutes on typical repos). Cached to disk on shutdown with config-file hashes and mtime index. Subsequent activations load cache instantly, walk filesystem, re-parse only dirty files (typically <2 seconds). Live updates via fs watcher during session. Phase 7 simplified to tier-3 rendering only — the data is already there. Tiered readiness (tiers 0–2 first, tier 3 background) deferred as v2 optimization for 10k+ file repos.
+
+- **2026-04-17** — **Efficiency pass applied.** David called out a pattern: my designs wire things up that work but are often inefficient. Applied 8 cuts to v1 scope, zero user-visible features lost:
+  1. Monorepo collapsed from 4 workspaces (`cli`, `daemon`, `frontend`, `shared`) to 2 (`app`, `frontend`). Shared types live in a folder, not a package.
+  2. Event-emitter abstraction dropped — direct state mutation + broadcast + debounced persist. No speculative event bus for undo/replay that nothing calls.
+  3. Aho-Corasick mention index not serialized. Rebuilt in memory at activation (~100ms).
+  4. Three health-runner classes (`tsc`, `eslint`, `generic`) collapsed to one runner + named parsers.
+  5. Workspace state machine collapsed from 5 states (`unknown`, `registered`, `active`, `paused`, `disabled`) to 3 (`active`, `paused`, `disabled`). Pre-activation = no record.
+  6. MCP tools cut from 5 (`arch_neighbors`, `arch_impact`, `arch_find`, `arch_get_selection`, `arch_health`) to 2 (`arch_neighbors`, `arch_health`). The rest are derivable or redundant with `<arch-context>`.
+  7. GUI settings panel removed from v1. CLI-only via `schematic config get/set`.
+  8. GUI event drawer removed from v1. CLI tail via `schematic log --tail`.
+  
+  Call-graph extraction also split out of Stage 6 into Stage 9b — symbols extracted in first pass, call edges follow if needed. Corresponding design principle saved: **curated smooth, no options.** v1 ships a single opinionated path, not a tree of toggles.
+
+- **2026-04-17** — Terminal-to-map switching surfaced as an open UX concern. `<arch-context>` injection already eliminates the "type the filename" friction (user clicks a node, says "fix it"), but eye-switching remains for single-monitor users. v1 assumes dual-monitor workflow; embedded xterm.js terminal is a v1.5 candidate if dogfood proves the friction real.
