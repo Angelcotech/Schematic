@@ -20,6 +20,7 @@ import {
 } from "./cache/positions.js";
 import type { NodeStoreRegistry } from "./node-store.js";
 import type { ActivationManager } from "./workspaces/activate.js";
+import { buildArchContext } from "./context/arch-context.js";
 
 export interface DaemonContext {
   registry: WorkspaceRegistry;
@@ -143,6 +144,19 @@ export function createRequestHandler(
           nodes: store?.all() ?? [],
           edges: store?.edges() ?? [],
         });
+      }
+
+      // /workspaces/:id/selection — POST { node_id: string | null }
+      // Frontend mirrors its current selection here so arch-context can
+      // read it on the next UserPromptSubmit.
+      const selectionMatch = /^\/workspaces\/([^/]+)\/selection$/.exec(path);
+      if (method === "POST" && selectionMatch) {
+        const id = selectionMatch[1];
+        const store = ctx.nodeStores.get(id);
+        if (!store) return err(res, 404, "unknown workspace");
+        const body = JSON.parse(await readBody(req)) as { node_id: string | null };
+        store.setSelection(body.node_id);
+        return json(res, 200, { ok: true });
       }
 
       // /workspaces/:id/positions — POST { positions: [...] }
@@ -324,8 +338,19 @@ async function handleHook(ctx: DaemonContext, payload: HookPayload): Promise<Hoo
     );
   }
 
-  // arch-context for UserPromptSubmit — populated in Stage 10. For now the
-  // hook flow is wired end-to-end but the injected context is empty.
+  // Populate arch-context on UserPromptSubmit so Claude sees what the user
+  // is looking at. Only this event uses the additionalContext field.
+  if (payload.event === "UserPromptSubmit") {
+    const storeForCtx = ctx.nodeStores.get(workspace.id);
+    if (!storeForCtx) return {};
+    const additionalContext = buildArchContext({
+      workspace,
+      nodes: storeForCtx.all(),
+      edges: storeForCtx.edges(),
+    });
+    return { additionalContext };
+  }
+
   return {};
 }
 

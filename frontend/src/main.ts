@@ -187,6 +187,23 @@ function setSelection(nodeId: string | null): void {
   if (changed) {
     rebuildBuffers();
     requestFrame();
+    // Mirror the selection to the daemon so arch-context reflects it on
+    // the next UserPromptSubmit. Fire-and-forget — any network error
+    // just means CC will receive an older selection, never a crash.
+    void syncSelection(nodeId);
+  }
+}
+
+async function syncSelection(nodeId: string | null): Promise<void> {
+  if (!app.activeWorkspaceId) return;
+  try {
+    await fetch(`${DAEMON_ORIGIN}/workspaces/${app.activeWorkspaceId}/selection`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ node_id: nodeId }),
+    });
+  } catch {
+    // Schematic is peripheral — don't bubble transport failures.
   }
 }
 

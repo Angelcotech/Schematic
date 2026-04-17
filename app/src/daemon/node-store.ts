@@ -152,6 +152,16 @@ export class WorkspaceNodeStore {
     }
   }
 
+  // Mirror the frontend's user_state so arch-context can find what the
+  // user is looking at. Passing `null` clears the selection.
+  setSelection(nodeId: string | null): void {
+    for (const node of this.nodes.values()) {
+      const shouldSelect = nodeId !== null && node.id === nodeId;
+      node.user_state = shouldSelect ? "selected" : "none";
+      if (shouldSelect) node.last_user_touch = Date.now();
+    }
+  }
+
   // Replace the graph with freshly-extracted data, preserving the
   // hot/ephemeral state (ai_intent, user_state, mentions) that bootstrap
   // hooks and user clicks have already accumulated.

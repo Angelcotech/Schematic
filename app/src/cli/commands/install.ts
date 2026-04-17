@@ -1,5 +1,6 @@
 import { writeFile, mkdir, chmod } from "node:fs/promises";
-import { join } from "node:path";
+import { dirname, join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import { SCHEMATIC_HOME } from "../../daemon/persist/paths.js";
 import { readOrInitConfig } from "../../daemon/persist/config.js";
 import { generateHookScript } from "../hook-template.js";
@@ -12,6 +13,12 @@ export async function install(): Promise<void> {
   const hooksDir = join(SCHEMATIC_HOME, "hooks");
   const hookScriptPath = join(hooksDir, "hook.mjs");
 
+  // MCP server lives next to this compiled CLI — at app/dist/mcp/index.js.
+  // Compute from import.meta.url so the path is correct wherever the
+  // install binary is invoked from.
+  const here = dirname(fileURLToPath(import.meta.url));
+  const mcpServerPath = resolve(here, "..", "..", "mcp", "index.js");
+
   console.log("Schematic installer");
   console.log("───────────────────");
 
@@ -20,7 +27,7 @@ export async function install(): Promise<void> {
   await chmod(hookScriptPath, 0o755);
   console.log(`✔ hook script written to ${hookScriptPath}`);
 
-  await installSchematicEntries({ hookScriptPath });
+  await installSchematicEntries({ hookScriptPath, mcpServerPath });
   console.log(`✔ ${CLAUDE_SETTINGS} updated (MCP entry + 3 hooks)`);
 
   if (!(await isDaemonRunning())) {

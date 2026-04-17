@@ -74,6 +74,7 @@ function stripSchematic(settings: ClaudeSettings): ClaudeSettings {
 
 export interface InstallPaths {
   hookScriptPath: string; // absolute path to the Node hook script
+  mcpServerPath: string;  // absolute path to the compiled MCP server entry
 }
 
 export async function installSchematicEntries(paths: InstallPaths): Promise<void> {
@@ -96,12 +97,13 @@ export async function installSchematicEntries(paths: InstallPaths): Promise<void
     settings.hooks[event] = existing;
   }
 
-  // MCP entry is a placeholder in Stage 4. Stage 10 replaces the command
-  // with the real MCP child process.
+  // MCP server — CC spawns this as a stdio child when it needs Schematic
+  // tools (arch_neighbors, arch_health). The server process forwards each
+  // call to the running daemon over HTTP.
   settings.mcpServers ??= {};
   settings.mcpServers[SCHEMATIC_ID] = {
-    command: "echo",
-    args: ["schematic MCP server — not wired until Stage 10"],
+    command: "node",
+    args: [paths.mcpServerPath],
   };
 
   await writeSettings(settings);

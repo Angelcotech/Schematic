@@ -274,4 +274,22 @@ No new silent fallbacks.
 
 ---
 
+## Stage 10 scan
+
+**Date:** 2026-04-17
+**Scope:** `daemon/context/arch-context.ts` (new), `mcp/index.ts` (new MCP server), `http.ts` (selection endpoint + arch-context injection), `node-store.ts` (setSelection), `settings-writer.ts` / `install.ts` (MCP command update), `frontend/main.ts` (selection sync).
+
+**Findings:**
+
+| Location | Pattern | Decision |
+|----------|---------|----------|
+| `mcp/index.ts:24-28` (`fetchOrNull`) | try/catch on fetch; returns null for ECONNREFUSED/ECONNRESET/ETIMEDOUT/ENETUNREACH/EHOSTUNREACH, re-throws others | **Justified.** MCP tools return a visible "Schematic daemon is not reachable" message when the daemon is down — explicit user-facing signal, not a silent swallow. Non-network errors still propagate. |
+| `mcp/index.ts` tool handlers | daemon-down response: `"Schematic daemon is not reachable. Run \`schematic start\`."` | **Justified design.** Reference-surface invariant: Schematic must never break a CC session. The alternative (MCP tool throws) would surface as a cryptic transport error to Claude. |
+| `frontend/main.ts` `syncSelection` try/catch | swallows any error | **Justified.** Selection mirror is best-effort; if the POST fails, the next action retries implicitly on the next setSelection. Stale selection is recoverable; breaking the UI click-flow isn't. |
+| `arch-context.ts` | no try/catch, no `||`/`??` fallbacks | **Clean.** Pure data transformation with explicit branches per node kind. |
+
+**Outcome:** 0 new silent fallbacks. 3 patterns reviewed — all are the reference-surface "Schematic-is-peripheral" principle already documented in the hook-template audit entry.
+
+---
+
 _(future stages appended here)_
