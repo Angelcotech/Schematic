@@ -118,6 +118,63 @@ Edges point from producer to consumer.
 - **Dependencies:** `webgl/viewport.ts` (pixelToData)
 - **Consumers:** `main.ts` (hover + click)
 
+### Daemon entry (`daemon/index.ts`)
+- **Home:** `app/src/daemon/index.ts`
+- **Inputs:** none at module load; `startDaemon()` reads config and registry
+- **Outputs:** bound HTTP+WS server on configured port; `DaemonHandle` with `stop()`
+- **Dependencies:** `persist/config`, `workspaces/registry`, `ws`, `http`
+- **Consumers:** `daemon/bin.ts` (pre-CLI), `cli/*` (Stage 4)
+
+### Daemon CLI entry (`daemon/bin.ts`)
+- **Home:** `app/src/daemon/bin.ts`
+- **Inputs:** process signals (SIGTERM, SIGINT)
+- **Outputs:** starts daemon, installs signal handlers for graceful shutdown
+- **Dependencies:** `daemon/index.ts`
+- **Consumers:** `pnpm --filter @schematic/app daemon` (dev script); replaced by `schematic start` in Stage 4
+
+### HTTP request handler (`daemon/http.ts`)
+- **Home:** `app/src/daemon/http.ts`
+- **Inputs:** `DaemonContext` (registry, ws, state, startedAt); incoming HTTP requests
+- **Outputs:** JSON responses (200 / 400 / 404 / 500); side effects on registry + ws broadcast
+- **Routes:** `GET /status`, `GET /workspaces`, `POST /hook`
+- **Dependencies:** `workspaces/router`, `workspaces/registry`, `ws`
+- **Consumers:** `daemon/index.ts` wires it into the Node HTTP server
+
+### WS broadcaster (`daemon/ws.ts`)
+- **Home:** `app/src/daemon/ws.ts`
+- **Inputs:** HTTP server (for upgrade), `SchematicEvent` broadcasts from other daemon code
+- **Outputs:** WS messages to connected clients
+- **Protocol:** client sends `subscribe` with optional workspace_id; server sends `ready` on connect, `event` per broadcast
+- **Dependencies:** `ws` library, `shared/ws-messages`, `shared/event`
+- **Consumers:** `daemon/index.ts`, `daemon/http.ts` (calls `broadcast()`); browser WS client in Stage 5
+
+### Workspace registry (`daemon/workspaces/registry.ts`)
+- **Home:** `app/src/daemon/workspaces/registry.ts`
+- **Inputs:** `~/.schematic/workspaces.json` on load; in-memory state mutations
+- **Outputs:** `Workspace[]`, atomic writes to disk on every mutation
+- **Dependencies:** `persist/paths`, `persist/atomic-write`, `workspaces/state-machine` (transition legality)
+- **Consumers:** `http.ts`, `daemon/index.ts`
+
+### State machine (`daemon/workspaces/state-machine.ts`)
+- **Home:** `app/src/daemon/workspaces/state-machine.ts`
+- **Inputs:** current + desired `WorkspaceState`
+- **Outputs:** boolean legality check; hard-fail assertion
+- **Dependencies:** none (pure logic)
+- **Consumers:** `registry.ts`
+
+### cwd router (`daemon/workspaces/router.ts`)
+- **Home:** `app/src/daemon/workspaces/router.ts`
+- **Inputs:** a cwd path and the registry
+- **Outputs:** matched workspace OR `{shouldAutoActivate, root}` for first-time marker discovery; `newWorkspace(root)` factory
+- **Dependencies:** `node:fs/promises`, `node:crypto` (hash for stable IDs), shared types
+- **Consumers:** `http.ts` hook handler
+
+### Paths + config + atomic write
+- **Home:** `app/src/daemon/persist/`
+- **Files:** `paths.ts` (constants), `atomic-write.ts`, `config.ts`
+- **Outputs:** `SchematicConfig`, initialized directory structure under `~/.schematic/`
+- **Consumers:** registry (save), daemon index (readOrInitConfig), future Stage 4 CLI
+
 ---
 
 ## Cross-boundary connections
@@ -125,10 +182,14 @@ Edges point from producer to consumer.
 _(empty — populated as boundaries are defined)_
 
 ### CC ↔ Daemon
-_(to be recorded in Stage 3)_
+- **Transport (Stage 3):** HTTP POST to `localhost:<port>/hook`. Payload schema in `shared/hook-payload.ts`. Hook scripts are Stage 5.
+- **Transport (Stage 10):** MCP stdio — separate channel. Not wired yet.
 
 ### Daemon ↔ Browser
-_(to be recorded in Stage 3)_
+- **Transport:** WebSocket at `ws://localhost:<port>/ws`.
+- **Client → Server:** `{ type: "subscribe", workspace_id? }`
+- **Server → Client:** `{ type: "ready", server_time }` on connect; `{ type: "event", event: SchematicEvent }` per broadcast.
+- **Browser WS client:** not yet implemented; added in Stage 5.
 
 ### Daemon ↔ Filesystem
 _(to be recorded in Stage 6)_
@@ -158,3 +219,4 @@ _(to be recorded in Stage 11)_
 | 2026-04-17 | 2.4 | `graph/hit-test.ts` — O(n) AABB pixel→node with kind priority |
 | 2026-04-17 | 2.5-2.7 | `main.ts` rewritten: graph render loop, hover, click-select, Space cycles ai_intent, Esc deselects, F fits to screen |
 | 2026-04-17 | 2.x | Zoom tuning: accumulator+threshold pattern ported from GateStack Pro (80-unit threshold, 1.08 factor per step). `viewport.zoom()` fixed to anchor on cursor data point. Halo scaled as fraction of node size, colors more saturated. |
+| 2026-04-17 | 3.1-3.8 | Daemon skeleton: app workspace scaffolding, HTTP (status/workspaces/hook), WebSocket (ready + event broadcast), workspace registry with 3-state machine, cwd router with marker-based auto-activation, config + atomic persistence, SIGTERM/SIGINT graceful shutdown. Shared types: Workspace, HookPayload, SchematicEvent, WS messages. |

@@ -95,4 +95,31 @@ Also noted: `tsconfig.base.json` dropped `exactOptionalPropertyTypes: true`. Oth
 
 ---
 
+## Stage 3 scan
+
+**Date:** 2026-04-17
+**Scope:** new files under `app/src/daemon/**` and `app/src/shared/{workspace, hook-payload, event, ws-messages}.ts`
+
+**Commands used:**
+```
+rg 'catch\s*[\({]|try\s*\{|fallback|retry' app/src
+rg '\?\?\s' app/src
+rg '\|\|\s' app/src
+```
+
+**Findings:**
+
+| Location | Pattern | Decision |
+|----------|---------|----------|
+| `daemon/workspaces/router.ts:26-29` | try/catch on `access()` to implement `exists()` | **Justified.** Idiomatic Node.js file-existence check. Catches ENOENT specifically and re-throws any other error (permission denied, etc.), so silent-swallow is impossible. |
+| `daemon/workspaces/registry.ts:12-16` | try/catch on `readFile(workspaces.json)` | **Justified.** First-run init: no file → empty registry. ENOENT-specific catch, re-throws other errors. |
+| `daemon/persist/config.ts:27-31` | try/catch on `readFile(config.json)` | **Justified.** First-run init: no file → write defaults. ENOENT-specific, re-throws other errors. Function named `readOrInitConfig` to make intent explicit. |
+| `daemon/http.ts:25-51` | try/catch at top of request handler | **Justified.** HTTP error boundary: prevents an unhandled exception in a handler from crashing the daemon. Always logs to console + returns 500 to client. This is required for any HTTP service and not a fallback that hides behavior. |
+| `daemon/http.ts:26-27` | `req.url ?? "/"` and `req.method ?? "GET"` | **Removed.** Replaced with an explicit check that returns a 400 response when the fields are missing. Hardwired per Law 1 — don't paper over "can't happen" cases with defaults. |
+| `daemon/ws.ts:31` | `msg.workspace_id ?? null` | **Justified.** Normalizes optional field (undefined) to explicit null for internal storage. Not a fallback; type coercion. |
+
+**Outcome:** 1 soft fallback removed (request defaults), 5 patterns justified as init / idiomatic / error boundary.
+
+---
+
 _(future stages appended here)_
