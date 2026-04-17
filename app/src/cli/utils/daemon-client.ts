@@ -14,12 +14,22 @@ export async function isDaemonRunning(): Promise<boolean> {
     const r = await fetch(await daemonUrl("/status"));
     return r.ok;
   } catch (e) {
-    // Node's undici fetch wraps connection errors as `TypeError: fetch failed`
-    // with the underlying syscall error in `e.cause`. Check both shapes so
-    // this works on older Node too.
+    // Any connectivity error to localhost means the daemon is not reachable
+    // right now. ECONNREFUSED = not bound. ECONNRESET / ETIMEDOUT = tearing
+    // down mid-request (happens during stop). We treat all of these as "not
+    // running" because that's the semantic the caller wants — is the daemon
+    // available for commands? Unexpected non-network errors still surface.
     const direct = (e as NodeJS.ErrnoException).code;
     const nested = ((e as { cause?: NodeJS.ErrnoException }).cause)?.code;
-    if (direct === "ECONNREFUSED" || nested === "ECONNREFUSED") return false;
+    const code = direct ?? nested;
+    const networkErrors = new Set([
+      "ECONNREFUSED",
+      "ECONNRESET",
+      "ETIMEDOUT",
+      "ENETUNREACH",
+      "EHOSTUNREACH",
+    ]);
+    if (code && networkErrors.has(code)) return false;
     throw e;
   }
 }

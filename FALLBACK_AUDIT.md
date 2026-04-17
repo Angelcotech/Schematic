@@ -150,4 +150,33 @@ rg '\?\?\s' app/src/cli
 
 ---
 
+## Stage 5 scan
+
+**Date:** 2026-04-17
+**Scope:** new files `app/src/daemon/{node-store,decay}.ts`, `frontend/src/state/{ws-client,graph-store}.ts`, rewritten `frontend/src/main.ts`, additions to `app/src/daemon/http.ts` (CORS, nodes endpoint), `app/src/daemon/workspaces/router.ts` (marker fix).
+
+**Commands used:**
+```
+rg 'catch\s*[\({]|try\s*\{|fallback|retry' app/src/daemon/{node-store,decay}.ts frontend/src/state
+rg '\?\?\s' app/src/daemon/node-store.ts frontend/src/state frontend/src/main.ts
+```
+
+**Findings:**
+
+| Location | Pattern | Decision |
+|----------|---------|----------|
+| `frontend/src/state/ws-client.ts` BACKOFF_SCHEDULE_MS | Reconnect schedule `[1s, 2s, 5s, 10s, 10s, ...]` | **Justified.** Explicit finite schedule, no open-ended loop — deterministic re-attempt cadence documented per Build Law 1. |
+| `frontend/src/main.ts:206` | `(urlParam && wsList.find(...)) ?? wsList.find(w => w.state === "active") ?? null` | **Justified.** Chained nullish is priority ordering: URL param overrides first-active-workspace. Each tier is an explicit rule, not silent fallback. |
+| `frontend/src/main.ts:280` | `n.language ?? ""` (tooltip text) | **Justified.** UI display default when language wasn't extracted yet (pre-Stage 6 bootstrap node). |
+| `app/src/daemon/node-store.ts:143` | `payload.tool ?? undefined` | **Justified.** Normalizing optional field for NodeState. |
+| `app/src/daemon/node-store.ts:160` | `node.ai_intent_since ?? 0` | **Justified, self-healing.** If a node is non-idle but has no since timestamp (an invariant violation), the decay pass treats it as old and demotes to idle. Recovery to a good state, not bug concealment. |
+| `app/src/daemon/http.ts` new `/workspaces/:id/nodes` | `store?.all() ?? []` | **Justified.** Workspace exists but no hooks have fired yet → empty array is the correct state, not a fallback. |
+| `app/src/cli/utils/daemon-client.ts` expanded catch | `isDaemonRunning` now handles ECONNREFUSED, ECONNRESET, ETIMEDOUT, ENETUNREACH, EHOSTUNREACH | **Justified widening.** The function's semantic question is "can we reach the daemon?" — any localhost-connectivity error answers no. Unexpected non-network errors still surface. |
+
+**Also fixed during Stage 5 (bug, not a fallback):** the router treated `.schematic/` directory as an auto-activation marker, which conflicted with our own `~/.schematic/` state dir and caused spurious workspace registration for `$HOME`. Removed `.schematic/` from the marker set; `.schematic.json` is now the sole explicit auto-activation signal. Updated BUILDING_PLAN §7 and USER_SIMULATION to match.
+
+**Outcome:** 0 fallbacks introduced, 7 patterns reviewed and justified, 1 routing bug fixed.
+
+---
+
 _(future stages appended here)_

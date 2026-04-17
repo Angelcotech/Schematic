@@ -1,11 +1,15 @@
 // cwd → workspace routing.
 //
-// Walks up from the given cwd looking for a repo root (.git / .schematic.json
-// / .schematic). If the resolved root already has a workspace record, returns
-// it. Otherwise inspects marker files to decide:
+// Walks up from the given cwd looking for a repo root (.git or
+// .schematic.json). If the resolved root already has a workspace record,
+// returns it. Otherwise inspects marker files to decide:
 //   - .schematic-ignore  → do not activate (user opted out)
-//   - .schematic.json or .schematic/  → ready for auto-activation
-//   - anything else (e.g. bare .git)  → no record, no auto-activation
+//   - .schematic.json    → ready for auto-activation
+//   - bare .git only     → no record, no auto-activation
+//
+// Note: `.schematic/` directory is NOT a marker (it conflicts with our own
+// `~/.schematic/` state directory). `.schematic.json` is the sole explicit
+// auto-activation signal.
 
 import { access } from "node:fs/promises";
 import { resolve, dirname, join, basename } from "node:path";
@@ -19,7 +23,7 @@ export interface RouteResult {
   root: string | null;
 }
 
-const REPO_MARKERS = [".schematic.json", ".schematic", ".git"] as const;
+const REPO_MARKERS = [".schematic.json", ".git"] as const;
 const IGNORE_MARKER = ".schematic-ignore";
 
 async function exists(path: string): Promise<boolean> {
@@ -45,9 +49,7 @@ async function findRepoRoot(startCwd: string): Promise<DiscoveredRoot | null> {
       if (await exists(join(dir, marker))) {
         return {
           root: dir,
-          hasExplicitMarker:
-            (await exists(join(dir, ".schematic.json"))) ||
-            (await exists(join(dir, ".schematic"))),
+          hasExplicitMarker: await exists(join(dir, ".schematic.json")),
           hasIgnore: await exists(join(dir, IGNORE_MARKER)),
         };
       }

@@ -342,8 +342,9 @@ Daemon applies, computes state delta, broadcasts to all clients. Gives you a fre
 ### Workspace identity
 
 - Workspace = (repo root path, git remote URL if present)
-- Repo root discovery: walk up from `cwd` until `.git/`, `.schematic/`, or `.schematic.json` is found
+- Repo root discovery: walk up from `cwd` until `.git/` or `.schematic.json` is found
 - Persisted in `~/.schematic/workspaces.json` keyed by workspace ID (hash of root path)
+- **`.schematic/` directory is NOT a marker.** It's reserved for our tool-state dir (`~/.schematic/`) and would conflict. `.schematic.json` is the sole explicit auto-activation signal.
 
 ### State machine
 

@@ -12,9 +12,11 @@ import type { Workspace } from "../shared/workspace.js";
 import type { WorkspaceRegistry } from "./workspaces/registry.js";
 import type { WSBroadcaster } from "./ws.js";
 import { newWorkspace, route } from "./workspaces/router.js";
+import type { NodeStoreRegistry } from "./node-store.js";
 
 export interface DaemonContext {
   registry: WorkspaceRegistry;
+  nodeStores: NodeStoreRegistry;
   ws: WSBroadcaster;
   startedAt: number;
   state: { eventCount: number };
@@ -25,10 +27,23 @@ export function createRequestHandler(
   requestShutdown: () => void,
 ): (req: IncomingMessage, res: ServerResponse) => void {
   return async (req, res) => {
+    // Local-only CORS. The daemon binds 127.0.0.1, so Access-Control-Allow-Origin: *
+    // only ever allows same-machine browsers. Required so the Vite dev server
+    // (on its own port) can fetch from the daemon.
+    res.setHeader("Access-Control-Allow-Origin", "*");
+    res.setHeader("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS");
+    res.setHeader("Access-Control-Allow-Headers", "Content-Type");
+
     try {
       const { url, method } = req;
       if (!url || !method) {
         return err(res, 400, "malformed request: missing url or method");
+      }
+
+      if (method === "OPTIONS") {
+        res.statusCode = 204;
+        res.end();
+        return;
       }
 
       const parsed = new URL(url, "http://localhost");
@@ -87,8 +102,18 @@ export function createRequestHandler(
       if (method === "DELETE" && idMatch) {
         const id = idMatch[1];
         await ctx.registry.forget(id);
+        ctx.nodeStores.drop(id);
         ctx.ws.broadcast({ type: "workspace.forgotten", workspace_id: id, timestamp: Date.now() }, id);
         return json(res, 200, { ok: true });
+      }
+
+      // /workspaces/:id/nodes — GET current NodeState snapshot (lets a
+      // reconnecting browser bootstrap without waiting for new hook events).
+      const nodesMatch = /^\/workspaces\/([^/]+)\/nodes$/.exec(path);
+      if (method === "GET" && nodesMatch) {
+        const id = nodesMatch[1];
+        const store = ctx.nodeStores.get(id);
+        return json(res, 200, store?.all() ?? []);
       }
 
       if (method === "GET" && path === "/resolve") {
@@ -198,6 +223,24 @@ async function handleHook(ctx: DaemonContext, payload: HookPayload): Promise<Hoo
     { type: "hook.received", workspace_id: workspace.id, payload, timestamp: Date.now() },
     workspace.id,
   );
+
+  // Apply the hook to the workspace's bootstrap node store. Stage 6 replaces
+  // this with full graph extraction; until then this is how file-level
+  // activity becomes visible in the frontend.
+  const store = ctx.nodeStores.getOrCreate(workspace.id);
+  const change = store.applyHook(workspace, payload);
+  if (change) {
+    ctx.ws.broadcast(
+      {
+        type: "node.state_change",
+        workspace_id: workspace.id,
+        node_id: change.id,
+        node: change.node,
+        timestamp: Date.now(),
+      },
+      workspace.id,
+    );
+  }
 
   // arch-context for UserPromptSubmit — populated in Stage 10. For now the
   // hook flow is wired end-to-end but the injected context is empty.

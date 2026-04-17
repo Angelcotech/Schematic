@@ -211,6 +211,37 @@ Edges point from producer to consumer.
 - **Hardwired silence:** on daemon unreachable, exits 0 with empty stdout so CC proceeds normally. Documented as deliberate reference-surface design, not a fallback.
 - **Consumers:** Claude Code itself (invokes per PreToolUse / PostToolUse / UserPromptSubmit)
 
+### Bootstrap node store (`daemon/node-store.ts`)
+- **Home:** `app/src/daemon/node-store.ts`
+- **Inputs:** `Workspace`, `HookPayload` (from the HTTP hook handler)
+- **Outputs:** `NodeState` mutations, emitted as `NodeChange` objects for broadcast
+- **Behavior:** maintains a per-workspace map of `file_path → NodeState`. Each hook derives an `ai_intent` value (reading / planning / modified / failed / deleted) and updates the corresponding node. Random-scatter positions until layout lands in Stage 7.
+- **Dependencies:** `shared/node-state`, `shared/hook-payload`, `shared/workspace`
+- **Consumers:** `daemon/http.ts` (applies hooks + serves snapshot at GET /workspaces/:id/nodes), `daemon/decay.ts` (periodic demotion)
+- **Scope:** in-memory only, replaced in Stage 6 by persistent graph cache from eager extraction.
+
+### Decay tick (`daemon/decay.ts`)
+- **Home:** `app/src/daemon/decay.ts`
+- **Inputs:** `NodeStoreRegistry`, `WSBroadcaster`
+- **Outputs:** periodic `node.state_change` broadcasts as stale ai_intent values demote to idle
+- **Cadence:** 10-second interval (unref'd so decay doesn't hold the event loop)
+- **Thresholds:** reading 60s, planning 30s, modified 5min, failed 10min, deleted 10min
+- **Consumers:** started by `daemon/index.ts`; stops on shutdown
+
+### Frontend WS client (`frontend/src/state/ws-client.ts`)
+- **Home:** `frontend/src/state/ws-client.ts`
+- **Inputs:** daemon WS URL, optional workspace_id filter, event callback, state-change callback
+- **Outputs:** dispatches SchematicEvents to the callback; reconnects with a fixed finite backoff schedule (1s, 2s, 5s, 10s repeating)
+- **Dependencies:** browser `WebSocket`, shared types
+- **Consumers:** `frontend/src/main.ts`
+
+### Frontend graph store (`frontend/src/state/graph-store.ts`)
+- **Home:** `frontend/src/state/graph-store.ts`
+- **Inputs:** WS events, initial snapshot from GET /workspaces/:id/nodes
+- **Outputs:** Map of NodeState; `subscribe()` fires on any mutation
+- **Dependencies:** shared types
+- **Consumers:** `frontend/src/main.ts` (renderer reads `store.all()`)
+
 ---
 
 ## Cross-boundary connections
@@ -257,3 +288,4 @@ _(to be recorded in Stage 11)_
 | 2026-04-17 | 2.x | Zoom tuning: accumulator+threshold pattern ported from GateStack Pro (80-unit threshold, 1.08 factor per step). `viewport.zoom()` fixed to anchor on cursor data point. Halo scaled as fraction of node size, colors more saturated. |
 | 2026-04-17 | 3.1-3.8 | Daemon skeleton: app workspace scaffolding, HTTP (status/workspaces/hook), WebSocket (ready + event broadcast), workspace registry with 3-state machine, cwd router with marker-based auto-activation, config + atomic persistence, SIGTERM/SIGINT graceful shutdown. Shared types: Workspace, HookPayload, SchematicEvent, WS messages. |
 | 2026-04-17 | 4.1-4.8 | Install CLI. New daemon endpoints: POST /shutdown, POST /workspaces (create), POST /workspaces/:id/state, DELETE /workspaces/:id, GET /resolve. POST /hook now accepts CC-native payload shape and returns hookSpecificOutput for UserPromptSubmit. CLI: start/stop/restart/status, install/uninstall, workspaces list/forget, activate/pause/resume/disable, config get/set, log --tail. Install writes hook.mjs to ~/.schematic/hooks/ and idempotent Schematic-tagged entries to ~/.claude/settings.json. Live-tested end-to-end against real ~/.claude/settings.json (backed up + restored). |
+| 2026-04-17 | 5.1-5.7 | Hook wiring end-to-end. Daemon: NodeStoreRegistry + WorkspaceNodeStore (per-workspace NodeState map driven by hooks), startDecayTick broadcasts decay events at 10s cadence, POST /hook now also produces node.state_change events, new GET /workspaces/:id/nodes endpoint, CORS headers added so Vite dev origin can fetch. Frontend: DaemonWSClient with finite reconnect backoff, GraphStore subscribed to renderer, main.ts rewritten to drive from live store. Router bug fixed — `.schematic/` directory no longer a marker (conflicted with ~/.schematic/). Live-tested: CC edits reflect on canvas within ~100ms. |

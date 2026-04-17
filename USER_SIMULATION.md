@@ -126,7 +126,7 @@ CC reads two files to answer. The moment the first `PreToolUse(Read)` hook fires
 
 2. **The daemon walks up** from `cwd` looking for a repo root. It finds `.git/` at `/Users/transcience/GateStack-Pro/`. It hashes that path → generates workspace ID `ws_f2a81c3d`. This is a new workspace.
 
-3. **The daemon checks** for `.schematic.json` or `.schematic/`. Neither exists. So the workspace auto-registers as `state = "registered"` — not active. No graph extraction, no tsc-watch, no file watching. Just a row in `workspaces.json`.
+3. **The daemon checks** for `.schematic.json` at the repo root. Not present. So no workspace is created yet — the daemon emits a one-time registration toast and waits for explicit activation.
 
 Immediately on the browser side, the top bar changes:
 

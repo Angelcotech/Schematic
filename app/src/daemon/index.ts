@@ -3,6 +3,8 @@ import { readOrInitConfig } from "./persist/config.js";
 import { WorkspaceRegistry } from "./workspaces/registry.js";
 import { WSBroadcaster } from "./ws.js";
 import { createRequestHandler, type DaemonContext } from "./http.js";
+import { NodeStoreRegistry } from "./node-store.js";
+import { startDecayTick } from "./decay.js";
 
 export interface DaemonHandle {
   port: number;
@@ -15,15 +17,20 @@ export async function startDaemon(): Promise<DaemonHandle> {
   const registry = new WorkspaceRegistry();
   await registry.load();
 
+  const nodeStores = new NodeStoreRegistry();
+
   const httpServer = createServer();
   const ws = new WSBroadcaster(httpServer);
 
   const ctx: DaemonContext = {
     registry,
+    nodeStores,
     ws,
     startedAt: Date.now(),
     state: { eventCount: 0 },
   };
+
+  const stopDecay = startDecayTick(nodeStores, ws);
 
   // requestShutdown lets the POST /shutdown handler trigger graceful stop.
   // Populated below after `stop` is defined.
@@ -40,6 +47,8 @@ export async function startDaemon(): Promise<DaemonHandle> {
   console.log(`[schematic] workspaces loaded: ${registry.all().length}`);
 
   const stop = async (): Promise<void> => {
+    console.log("[schematic] shutdown: stopping decay tick");
+    stopDecay();
     console.log("[schematic] shutdown: closing ws clients");
     ws.close();
     console.log("[schematic] shutdown: closing http server");
