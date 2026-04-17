@@ -29,15 +29,20 @@ See [`USER_SIMULATION.md`](./USER_SIMULATION.md) for the narrative walkthrough t
 
 ## 1. Product
 
-**Schematic** is an interactive architecture map. It renders the codebase as a node graph that the developer and an AI assistant (Claude Code) both operate on in real time.
+**Schematic** is a live reference to what Claude Code is doing structurally and architecturally in your codebase. It renders the repo as a node graph; as CC works, the map reflects activity, health, and focus in real time.
 
 **The gap it closes:** the developer carries the architecture mentally; the AI operates on file paths. The user is effectively blind when directing edits across a large codebase. Schematic is a window that closes that gap — both parties highlight, click, and navigate the same graph.
 
+**Product identity — second screen, not workbench.** Schematic is not a primary interface for interacting with CC. CC continues to run in the user's existing terminal, as usual. Schematic is the **reference surface** — glanceable, peripheral, always-on — showing what CC is changing, where, and whether it's healthy. Like a developer watching a log tail or a health dashboard while they work. Deep interaction (clicking nodes, dragging modules to organize) happens occasionally; glancing happens constantly.
+
+This identity drives priorities: glanceability > interactivity, legibility-at-a-glance > depth-on-click, continuous visual truth > explicit user queries.
+
 **What it is not:**
-- Not a codebase visualizer or static diagram renderer — it is a live, bidirectional collaboration surface.
+- Not a codebase visualizer or static diagram renderer — it is a live collaboration surface.
 - Not a documentation tool.
-- **Not a chat client.** Claude Code runs in the user's existing terminal. Schematic is a companion surface — the map, the diagnostics, and the bidirectional context — not a second place to type to CC. An embedded chat panel is a v2 candidate.
+- **Not a chat client.** CC runs in the user's existing terminal. Schematic is a reference, not a second place to type to CC. An embedded chat panel is a v2 candidate and may never land — the design works without it.
 - Not an editor. Users edit code in their existing editor; CC edits via its tool calls.
+- **Not constantly looked at.** Users work in their terminal; Schematic is peripheral. If the design ever requires the user to stare at the map to work effectively, the design is wrong.
 
 **Audience:** developers who work with AI assistants (primarily Claude Code) on non-trivial codebases.
 
