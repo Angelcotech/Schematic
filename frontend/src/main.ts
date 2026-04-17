@@ -594,8 +594,21 @@ function drawOverlay(): void {
   if (hoveredNodeId !== null) {
     const n = store.get(hoveredNodeId);
     if (n) {
+      const lines: string[] = [n.name];
       const metric = tooltipMetric(n);
-      drawTooltip(overlay, cursorPx, cursorPy, metric === "" ? [n.name] : [n.name, metric]);
+      if (metric !== "") lines.push(metric);
+      // Inline diagnostic per BUILDING_PLAN §8: when a node has errors or
+      // warnings, surface the first message in the hover tooltip so the
+      // user gets action-forcing feedback without opening a panel.
+      if (n.health === "error" || n.health === "warning") {
+        const label = n.health === "error" ? "✗" : "⚠";
+        const source = n.health_source ? ` (${n.health_source})` : "";
+        const detail = n.health_detail ?? "";
+        lines.push(`${label} ${detail}${source}`);
+      } else if (n.kind === "module" && (n.aggregated_health?.error ?? 0) > 0) {
+        lines.push(`✗ ${n.aggregated_health.error} errors in module`);
+      }
+      drawTooltip(overlay, cursorPx, cursorPy, lines);
     }
   }
 }

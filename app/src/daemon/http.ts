@@ -111,7 +111,7 @@ export function createRequestHandler(
         if (body.to === "active") {
           void ctx.activations.activate(ws);
         } else {
-          void ctx.activations.deactivate(ws.id);
+          ctx.activations.deactivate(ws.id);
         }
         return json(res, 200, ws);
       }
@@ -121,7 +121,7 @@ export function createRequestHandler(
       if (method === "DELETE" && idMatch) {
         const id = idMatch[1];
         await ctx.registry.forget(id);
-        await ctx.activations.deactivate(id);
+        ctx.activations.deactivate(id);
         ctx.nodeStores.drop(id);
         ctx.ws.broadcast({ type: "workspace.forgotten", workspace_id: id, timestamp: Date.now() }, id);
         return json(res, 200, { ok: true });
@@ -191,8 +191,7 @@ export function createRequestHandler(
       }
 
       // /workspaces/:id/relayout — POST, wipes manual positions and triggers
-      // a fresh extraction. The gate modal is a frontend concern; by the time
-      // this endpoint is hit, the user has already confirmed.
+      // a fresh extraction.
       const relayoutMatch = /^\/workspaces\/([^/]+)\/relayout$/.exec(path);
       if (method === "POST" && relayoutMatch) {
         const id = relayoutMatch[1];
@@ -202,7 +201,10 @@ export function createRequestHandler(
         store?.clearManualPositions();
         await deleteCache(id);
         await deletePositions(id);
-        await ctx.activations.deactivate(id);
+        // Don't deactivate — fs watcher and health runners are long-lived
+        // infrastructure per workspace. Relayout only invalidates the
+        // extracted graph; activate() with `inProgress` guard safely
+        // re-extracts and preserves existing watchers/runners.
         void ctx.activations.activate(workspace);
         return json(res, 200, { ok: true });
       }

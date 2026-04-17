@@ -111,6 +111,10 @@ interface NodeChange {
   node: NodeState | null; // null means "removed"
 }
 
+function severityRank(s: "error" | "warning" | "info"): number {
+  return s === "error" ? 3 : s === "warning" ? 2 : 1;
+}
+
 export class WorkspaceNodeStore {
   private readonly nodes = new Map<string, NodeState>();
   private edgesList: Edge[] = [];
@@ -162,13 +166,83 @@ export class WorkspaceNodeStore {
     }
   }
 
+  // Apply a full diagnostic snapshot from a single health source. The
+  // `covers` predicate decides which files this source is responsible for
+  // (e.g., tsc covers .ts/.tsx). Covered files not named in the snapshot
+  // get marked `ok`; covered files with diagnostics get the appropriate
+  // severity; non-covered files are left alone.
+  //
+  // Returns the list of node IDs whose health actually changed, so the
+  // caller can broadcast only what changed.
+  applyHealthSnapshot(
+    source: string,
+    covers: (nodeId: string) => boolean,
+    diagnostics: Array<{ node_id: string; severity: "error" | "warning" | "info"; message: string }>,
+  ): string[] {
+    const byNode = new Map<string, { severity: "error" | "warning" | "info"; count: number; firstMsg: string }>();
+    for (const d of diagnostics) {
+      const existing = byNode.get(d.node_id);
+      if (!existing) {
+        byNode.set(d.node_id, { severity: d.severity, count: 1, firstMsg: d.message });
+      } else {
+        existing.count += 1;
+        if (severityRank(d.severity) > severityRank(existing.severity)) existing.severity = d.severity;
+      }
+    }
+
+    const changed: string[] = [];
+    const now = Date.now();
+
+    for (const node of this.nodes.values()) {
+      if (node.kind !== "file") continue;
+      const inDiag = byNode.get(node.id);
+      const inScope = covers(node.id);
+
+      if (inDiag) {
+        // Always adopt the diagnostic, even if another source claimed this
+        // file earlier — keep the most recent owner.
+        const newHealth = inDiag.severity === "info" ? "warning" : inDiag.severity;
+        const newDetail = inDiag.count === 1
+          ? inDiag.firstMsg
+          : `${inDiag.firstMsg} (+${inDiag.count - 1} more)`;
+        if (
+          node.health !== newHealth ||
+          node.health_detail !== newDetail ||
+          node.health_source !== source
+        ) {
+          node.health = newHealth;
+          node.health_detail = newDetail;
+          node.health_source = source;
+          node.health_updated_ts = now;
+          changed.push(node.id);
+        }
+      } else if (inScope) {
+        // Covered by this source, no diagnostic → ok (clears previous
+        // errors from THIS source and also upgrades first-compile files
+        // from `unknown` to `ok`).
+        const shouldOwn = node.health_source === source || node.health === "unknown";
+        if (shouldOwn && node.health !== "ok") {
+          node.health = "ok";
+          node.health_detail = undefined;
+          node.health_source = source;
+          node.health_updated_ts = now;
+          changed.push(node.id);
+        }
+      }
+      // Outside this source's scope and not in its diagnostics → leave as-is.
+    }
+
+    return changed;
+  }
+
   // Replace the graph with freshly-extracted data, preserving the
-  // hot/ephemeral state (ai_intent, user_state, mentions) that bootstrap
-  // hooks and user clicks have already accumulated.
+  // hot/ephemeral state (ai_intent, user_state, health, manual positions)
+  // that hooks, user clicks, and health sources have accumulated.
   applyExtractedGraph(nodes: NodeState[], edges: Edge[]): void {
     const prevHot = new Map<string, Pick<NodeState,
       "ai_intent" | "ai_intent_since" | "ai_intent_tool" | "ai_intent_session" |
-      "user_state" | "last_ai_touch" | "manually_positioned" | "x" | "y"
+      "user_state" | "last_ai_touch" | "manually_positioned" | "x" | "y" |
+      "health" | "health_detail" | "health_source" | "health_updated_ts"
     >>();
     for (const n of this.nodes.values()) {
       prevHot.set(n.id, {
@@ -181,6 +255,10 @@ export class WorkspaceNodeStore {
         manually_positioned: n.manually_positioned,
         x: n.x,
         y: n.y,
+        health: n.health,
+        health_detail: n.health_detail,
+        health_source: n.health_source,
+        health_updated_ts: n.health_updated_ts,
       });
     }
 
@@ -200,6 +278,14 @@ export class WorkspaceNodeStore {
           n.x = hot.x;
           n.y = hot.y;
         }
+        // Preserve health state across re-extraction — tsc watch keeps
+        // running in the background and will replace this on its next
+        // compile, but between fs-change and next compile the node
+        // shouldn't flicker back to "unknown".
+        n.health = hot.health;
+        n.health_detail = hot.health_detail;
+        n.health_source = hot.health_source;
+        n.health_updated_ts = hot.health_updated_ts;
       }
       this.nodes.set(n.id, n);
     }

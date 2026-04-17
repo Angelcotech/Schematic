@@ -3,6 +3,8 @@
 // progress + graph_ready events. Provides `deactivate` to tear things
 // down on pause / disable / forget / daemon shutdown.
 
+import { readFile } from "node:fs/promises";
+import { join, relative } from "node:path";
 import type { Workspace } from "../../shared/workspace.js";
 import type { SchematicEvent } from "../../shared/event.js";
 import type { WSBroadcaster } from "../ws.js";
@@ -17,10 +19,15 @@ import {
 import { readPositions, type PositionsMap } from "../cache/positions.js";
 import { startWatcher, type FsChangeBatch } from "../fs-watch/watcher.js";
 import type { NodeState } from "../../shared/node-state.js";
+import {
+  HealthSourceRunner,
+  type HealthSourceConfig,
+} from "../health/runner.js";
 
 interface ActiveHandle {
   workspaceId: string;
   stopWatcher: () => void;
+  healthRunners: HealthSourceRunner[];
 }
 
 export class ActivationManager {
@@ -48,7 +55,12 @@ export class ActivationManager {
             console.error("[schematic] fs-change extraction failed:", e),
           ),
         );
-        this.handles.set(workspace.id, { workspaceId: workspace.id, stopWatcher: stop });
+        const healthRunners = await this.startHealthSources(workspace);
+        this.handles.set(workspace.id, {
+          workspaceId: workspace.id,
+          stopWatcher: stop,
+          healthRunners,
+        });
       }
       return true;
     } finally {
@@ -56,15 +68,19 @@ export class ActivationManager {
     }
   }
 
-  async deactivate(workspaceId: string): Promise<void> {
+  deactivate(workspaceId: string): void {
     const handle = this.handles.get(workspaceId);
     if (!handle) return;
     handle.stopWatcher();
+    for (const r of handle.healthRunners) r.stop();
     this.handles.delete(workspaceId);
   }
 
-  async shutdown(): Promise<void> {
-    for (const handle of this.handles.values()) handle.stopWatcher();
+  shutdown(): void {
+    for (const handle of this.handles.values()) {
+      handle.stopWatcher();
+      for (const r of handle.healthRunners) r.stop();
+    }
     this.handles.clear();
   }
 
@@ -120,6 +136,54 @@ export class ActivationManager {
     this.emitReady(workspace.id, graph.nodes.length, graph.edges.length);
   }
 
+  private async startHealthSources(workspace: Workspace): Promise<HealthSourceRunner[]> {
+    const configured = await readHealthSources(workspace.root);
+    if (configured.length === 0) return [];
+
+    const runners: HealthSourceRunner[] = [];
+    for (const src of configured) {
+      const name =
+        src.type === "tsc" ? "tsc" : src.name;
+
+      const runnerCfg: HealthSourceConfig =
+        src.type === "tsc"
+          ? { type: "tsc", name, cwd: workspace.root, ...(src.project !== undefined && { project: src.project }) }
+          : { type: "command", name, run: src.run, parser: src.parser, cwd: workspace.root };
+
+      const covers = coverageForSource(src);
+      const runner = new HealthSourceRunner(runnerCfg, (snapshot) => {
+        const store = this.stores.get(workspace.id);
+        if (!store) return;
+        // Translate absolute file paths → workspace-relative node IDs.
+        const mapped: Array<{ node_id: string; severity: "error" | "warning" | "info"; message: string }> = [];
+        for (const d of snapshot) {
+          const rel = relative(workspace.root, d.file);
+          if (rel.startsWith("..")) continue;
+          mapped.push({ node_id: rel, severity: d.severity, message: d.message });
+        }
+        const changed = store.applyHealthSnapshot(name, covers, mapped);
+        for (const nodeId of changed) {
+          const n = store.get(nodeId);
+          if (!n) continue;
+          this.ws.broadcast(
+            {
+              type: "node.state_change",
+              workspace_id: workspace.id,
+              node_id: nodeId,
+              node: { ...n },
+              timestamp: Date.now(),
+            },
+            workspace.id,
+          );
+        }
+      });
+      runner.start();
+      runners.push(runner);
+      console.log(`[schematic] health: ${name} source started for ${workspace.name}`);
+    }
+    return runners;
+  }
+
   private async onFsChange(workspace: Workspace, batch: FsChangeBatch): Promise<void> {
     // Simple strategy for v1: any fs change triggers a full re-extract. The
     // cache layer caps re-extraction time (<2s for Schematic-scale repos),
@@ -142,6 +206,51 @@ export class ActivationManager {
       edge_count: edgeCount,
       timestamp: Date.now(),
     });
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+interface SchematicJsonHealth {
+  sources?: Array<
+    | { type: "tsc"; project?: string }
+    | { type: "command"; name: string; run: string; parser: "tsc" }
+  >;
+}
+
+type ConfiguredSource =
+  | { type: "tsc"; project?: string }
+  | { type: "command"; name: string; run: string; parser: "tsc" };
+
+// A source's "coverage" — which files it could plausibly report on. Used
+// so a clean-compile snapshot can flip covered files from unknown → ok.
+// v1 ships static rules; a `command`-type source could declare its
+// extensions explicitly later.
+function coverageForSource(src: ConfiguredSource): (nodeId: string) => boolean {
+  if (src.type === "tsc") {
+    return (id) => id.endsWith(".ts") || id.endsWith(".tsx");
+  }
+  // Unknown command sources: conservative default — covers nothing.
+  // Diagnostics still apply; first-compile "ok" flip doesn't happen.
+  return () => false;
+}
+
+async function readHealthSources(root: string): Promise<ConfiguredSource[]> {
+  try {
+    const raw = await readFile(join(root, ".schematic.json"), "utf8");
+    const parsed = JSON.parse(raw) as { health?: SchematicJsonHealth };
+    const sources = parsed.health?.sources;
+    if (!Array.isArray(sources)) return [];
+    return sources;
+  } catch (e) {
+    if ((e as NodeJS.ErrnoException).code === "ENOENT") return [];
+    console.warn(
+      "[schematic] could not parse .schematic.json health config:",
+      (e as Error).message,
+    );
+    return [];
   }
 }
 

@@ -4,3 +4,4 @@ export * from "./workspace.js";
 export * from "./hook-payload.js";
 export * from "./event.js";
 export * from "./ws-messages.js";
+export * from "./diagnostic.js";

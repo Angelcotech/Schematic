@@ -3,5 +3,11 @@
     "App": { "paths": ["app/**"] },
     "Frontend": { "paths": ["frontend/**"] },
     "Docs": { "paths": ["*.md"] }
+  },
+  "health": {
+    "sources": [
+      { "type": "tsc", "project": "app/tsconfig.json" },
+      { "type": "tsc", "project": "frontend/tsconfig.json" }
+    ]
   }
 }

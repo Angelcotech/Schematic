@@ -85,6 +85,12 @@ export function startWatcher(
       clearTimeout(flushTimer);
       flushTimer = null;
     }
-    void watcher.close();
+    // Detach listeners so further batches don't fire, and just leak the
+    // underlying watcher. chokidar's close() on macOS can block the main
+    // thread for tens of seconds while FSEvents queues drain — enough to
+    // stall every other ongoing request. The workspace watcher is scoped
+    // to the process lifetime anyway (workspaces come back on daemon
+    // restart), so letting it linger until process exit is fine.
+    watcher.removeAllListeners();
   };
 }
