@@ -63,4 +63,36 @@ rg '\|\|\s' app/ frontend/src/
 
 ---
 
+## Stage 2 scan
+
+**Date:** 2026-04-17
+**Scope:** new/modified files in Stage 2:
+- `frontend/src/state/mock-graph.ts`
+- `frontend/src/graph/{node-renderer, edge-renderer, hit-test}.ts`
+- `frontend/src/main.ts` (rewritten)
+- `tsconfig.base.json`, `frontend/tsconfig.json`
+
+**Commands used:**
+```
+rg 'catch\s*\(|try\s*\{|fallback|retry' frontend/src
+rg '\?\?\s' frontend/src
+rg '\|\|\s' frontend/src
+```
+
+**Findings:**
+
+| Location | Pattern | Decision |
+|----------|---------|----------|
+| `frontend/src/graph/node-renderer.ts:164` | `LANGUAGE_FILL[n.language] ?? DEFAULT_FILL` | **Justified.** Language keys are open-ended (any string extractable from a file); unknown languages receive a default gray rather than crashing render. Not hiding a bug — a visual default for an open enum. |
+| `frontend/src/state/mock-graph.ts` | ~20 `partial.X ?? default` in `makeNode` helper | **Justified.** `makeNode` is a fixture constructor that fills defaults for missing fields. Not hiding errors; explicit optional-field defaults in a test factory. |
+| `frontend/src/main.ts:215` ternary chain | `n.kind === "module" ? "module" : n.kind` | **Justified.** Tooltip metric display for unenumerated kinds gracefully shows the kind name. UI polish, not system correctness. |
+| `frontend/src/graph/edge-renderer.ts:36-38` | `if (!src \|\| !dst) throw` | **Skipped.** Opposite of a fallback — hard-fails with a descriptive error if an edge references an unknown node. Hardwired correctness per Law 1. |
+| `frontend/src/graph/hit-test.ts:32-33`, `main.ts:185`, `renderer.ts:66`, `overlayLayer.ts:37` | `\|\|` in `if` conditions | **Skipped.** Boolean OR in conditions, not fallback assignments. |
+
+Also noted: `tsconfig.base.json` dropped `exactOptionalPropertyTypes: true`. Other strict flags kept. This lets optional properties hold explicit `undefined` — pragmatic for `NodeState` with many optional fields. Not a fallback; a language-feature tradeoff.
+
+**Outcome:** ok — 3 patterns reviewed and justified, 0 removed, 0 silent fallbacks introduced.
+
+---
+
 _(future stages appended here)_

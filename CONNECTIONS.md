@@ -84,10 +84,39 @@ Edges point from producer to consumer.
 
 ### Entry point (`main.ts`)
 - **Home:** `frontend/src/main.ts`
-- **Inputs:** browser (canvas element via DOM, mouse events)
-- **Outputs:** calls `render` on RAF
-- **Dependencies:** `webgl/renderer.ts`, `webgl/viewport.ts`, `webgl/overlayLayer.ts`
+- **Inputs:** browser (canvas element via DOM; mouse, wheel, keyboard events)
+- **Outputs:** calls `render` on RAF; mutates local `nodes[]` state; drives overlay tooltip
+- **Dependencies:** `webgl/*`, `graph/*`, `state/mock-graph.ts`
 - **Consumers:** browser loads via `index.html`
+
+### Mock graph (`mock-graph.ts`)
+- **Home:** `frontend/src/state/mock-graph.ts`
+- **Inputs:** none (hand-authored fixture)
+- **Outputs:** `MOCK_NODES: NodeState[]`, `MOCK_EDGES: Edge[]`
+- **Dependencies:** `@shared/index.js` types
+- **Consumers:** `main.ts` (source of truth for the local graph during Stage 2; replaced in Stage 6 by real extraction)
+
+### Node renderer (`node-renderer.ts`)
+- **Home:** `frontend/src/graph/node-renderer.ts`
+- **Inputs:** `GLContext`, `NodeState[]`
+- **Outputs:** `NodeBuffers` (halo, fill, border VAOs); draw command list via `nodeDraws`
+- **Dependencies:** `webgl/renderer.ts` (GLContext), `@shared/index.js` (NodeState)
+- **Consumers:** `main.ts` (builds buffers on load and on state change)
+
+### Edge renderer (`edge-renderer.ts`)
+- **Home:** `frontend/src/graph/edge-renderer.ts`
+- **Inputs:** `GLContext`, `NodeState[]`, `Edge[]`
+- **Outputs:** `EdgeBuffer` VAO; draw command list via `edgeDraw`
+- **Dependencies:** `webgl/renderer.ts`, `@shared/index.js`
+- **Consumers:** `main.ts`
+- **Hard-fail:** throws if an edge references an unknown node (no silent skip)
+
+### Hit test (`hit-test.ts`)
+- **Home:** `frontend/src/graph/hit-test.ts`
+- **Inputs:** `ViewportState`, `NodeState[]`, mouse pixel coords
+- **Outputs:** the hit `NodeState` (or `null`), prioritizing symbol > file > module
+- **Dependencies:** `webgl/viewport.ts` (pixelToData)
+- **Consumers:** `main.ts` (hover + click)
 
 ---
 
@@ -122,3 +151,10 @@ _(to be recorded in Stage 11)_
 | 2026-04-17 | 1.3 | `frontend/` workspace skeleton (Vite, TS, index.html, empty main.ts) |
 | 2026-04-17 | 1.5-1.7 | WebGL port: `viewport.ts`, `shaders.ts`, `renderer.ts`, `overlayLayer.ts` (written fresh, not literal copies — GateStack source was deeply trading-specific) |
 | 2026-04-17 | 1.9 | `main.ts` smoke test: blank WebGL canvas, pan/zoom, status hint overlay |
+| 2026-04-17 | 1.x | Favicon: inline SVG data-URL (3-node graph glyph) in `index.html` |
+| 2026-04-17 | 2.1 | `state/mock-graph.ts` — 11 nodes (3 modules + 8 files) with 11 edges |
+| 2026-04-17 | 2.2 | `graph/node-renderer.ts` — halo / fill / border triangle meshes per NodeState |
+| 2026-04-17 | 2.3 | `graph/edge-renderer.ts` — gl.LINES mesh per Edge |
+| 2026-04-17 | 2.4 | `graph/hit-test.ts` — O(n) AABB pixel→node with kind priority |
+| 2026-04-17 | 2.5-2.7 | `main.ts` rewritten: graph render loop, hover, click-select, Space cycles ai_intent, Esc deselects, F fits to screen |
+| 2026-04-17 | 2.x | Zoom tuning: accumulator+threshold pattern ported from GateStack Pro (80-unit threshold, 1.08 factor per step). `viewport.zoom()` fixed to anchor on cursor data point. Halo scaled as fraction of node size, colors more saturated. |

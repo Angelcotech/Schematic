@@ -11,20 +11,21 @@ export interface ViewportState {
   height: number;
 }
 
+// Zoom-to-point: the data point (centerX, centerY) stays fixed on screen
+// while the viewport bounds contract/expand around it. Matches the standard
+// interactive-map zoom behavior (Google Maps, Figma, GateStack Pro).
 export function zoom(
   vp: ViewportState,
   centerX: number,
   centerY: number,
   factor: number,
 ): ViewportState {
-  const halfX = (vp.xMax - vp.xMin) / 2 / factor;
-  const halfY = (vp.yMax - vp.yMin) / 2 / factor;
   return {
     ...vp,
-    xMin: centerX - halfX,
-    xMax: centerX + halfX,
-    yMin: centerY - halfY,
-    yMax: centerY + halfY,
+    xMin: centerX - (centerX - vp.xMin) / factor,
+    xMax: centerX + (vp.xMax - centerX) / factor,
+    yMin: centerY - (centerY - vp.yMin) / factor,
+    yMax: centerY + (vp.yMax - centerY) / factor,
   };
 }
 
