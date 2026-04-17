@@ -26,7 +26,7 @@ export type SchematicEvent =
       // Streamed during extraction so the browser can show a progress bar.
       type: "workspace.extraction_progress";
       workspace_id: string;
-      phase: "walk" | "modules" | "imports" | "layout" | "ready";
+      phase: "walk" | "modules" | "imports" | "symbols" | "layout" | "ready";
       processed: number;
       total: number;
       timestamp: number;

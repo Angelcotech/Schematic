@@ -256,4 +256,22 @@ rg '\?\?\s' frontend/src/graph/aggregation.ts
 
 ---
 
+## Stage 9 scan
+
+**Date:** 2026-04-17
+**Scope:** `extraction/symbols.ts` (new), `extraction/layout.ts` (padding fix), `extraction/extract.ts` (symbols phase), `cache/graph-cache.ts` (SCHEMA_VERSION bump), `frontend/main.ts` (symbol popup + label scaling), `frontend/node-renderer.ts` (halo constant).
+
+**Findings:**
+
+| Location | Pattern | Decision |
+|----------|---------|----------|
+| `symbols.ts:22-26` | try/catch on readFile | **Justified.** ENOENT → return empty symbol list (race between walk and parse). Other errors re-thrown. Mirrors imports.ts. |
+| `symbols.ts:68` | `symbolsByFile.get(file.relativePath) ?? []` in layout | **Justified.** Files with no extracted symbols (no TS, or no exports) legitimately have an empty list. |
+
+No new silent fallbacks.
+
+**Outcome:** 0 fallbacks introduced. Cache schema bumped from 1 to 2 so the layout change propagates to existing users on next activation.
+
+---
+
 _(future stages appended here)_

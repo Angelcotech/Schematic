@@ -6,6 +6,7 @@ import type { NodeState } from "../../shared/node-state.js";
 import { walkWorkspace, type WalkedFile } from "./walker.js";
 import { detectModules, type ModuleDef } from "./modules.js";
 import { parseImports, linkImports, type FileImport } from "./imports.js";
+import { parseSymbols, type ExtractedSymbol } from "./symbols.js";
 import { layOutModulesRow } from "./layout.js";
 
 export interface ExtractedGraph {
@@ -15,7 +16,7 @@ export interface ExtractedGraph {
 }
 
 export interface ExtractionProgress {
-  phase: "walk" | "modules" | "imports" | "layout" | "ready";
+  phase: "walk" | "modules" | "imports" | "symbols" | "layout" | "ready";
   processed: number;
   total: number;
 }
@@ -54,8 +55,23 @@ export async function extractWorkspace(
   for (const f of files) byAbsPath.set(f.absolutePath, f);
   const linked = linkImports(byAbsPath, perFileImports);
 
+  // Symbols — parsed per file, batched progress. Only TS/JS-family files
+  // contribute; other files (md, json) yield empty symbol lists.
+  onProgress?.({ phase: "symbols", processed: 0, total: files.length });
+  const symbolsByFile = new Map<string, ExtractedSymbol[]>();
+  let symbolDone = 0;
+  for (const file of files) {
+    const symbols = await parseSymbols(file);
+    if (symbols.length > 0) symbolsByFile.set(file.relativePath, symbols);
+    symbolDone++;
+    if (symbolDone % 100 === 0) {
+      onProgress?.({ phase: "symbols", processed: symbolDone, total: files.length });
+    }
+  }
+  onProgress?.({ phase: "symbols", processed: files.length, total: files.length });
+
   onProgress?.({ phase: "layout", processed: 0, total: modules.length });
-  const nodes = layOutModulesRow(modules);
+  const nodes = layOutModulesRow(modules, symbolsByFile);
   onProgress?.({ phase: "layout", processed: modules.length, total: modules.length });
 
   const edges: Edge[] = [];

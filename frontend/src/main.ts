@@ -63,9 +63,9 @@ let edgeBuffer: EdgeBuffer | null = null;
 // --- Zoom-tier LOD ---
 // Tier 0: only modules visible. File → file edges collapse into
 //         module → module aggregated edges with thickness = count.
-// Tier 1+: everything visible, raw edges.
-// Threshold: if files would render smaller than MIN_FILE_PIXELS on screen,
-// drop to tier 0.
+// Tier 1: modules + files with raw file-level edges.
+// Symbols are NOT rendered on the map — they appear in a side panel
+// when a file is clicked. Keeps the map readable at every zoom.
 const MIN_FILE_PIXELS = 55;
 
 function computeTier(): 0 | 1 {
@@ -74,11 +74,9 @@ function computeTier(): 0 | 1 {
   if (files.length === 0) return 1;
   const visibleDataWidth = viewport.xMax - viewport.xMin;
   if (visibleDataWidth <= 0) return 1;
-  // Use the smallest file width as the signal — if *any* file is too small
-  // to be legible, pull back to module-only tier.
   const minFileW = Math.min(...files.map((f) => f.width));
   const screenW = (minFileW / visibleDataWidth) * canvas.clientWidth;
-  return screenW >= MIN_FILE_PIXELS ? 1 : 0;
+  return screenW < MIN_FILE_PIXELS ? 0 : 1;
 }
 
 function aggregateEdgesByModule(rawEdges: Edge[], nodes: NodeState[]): Edge[] {
@@ -121,9 +119,9 @@ function rebuildBuffers(): void {
   const tier = computeTier();
   currentTier = tier;
 
-  const visibleNodes = tier === 0
-    ? allNodes.filter((n) => n.kind === "module")
-    : allNodes;
+  const visibleNodes =
+    tier === 0 ? allNodes.filter((n) => n.kind === "module") :
+    allNodes.filter((n) => n.kind !== "symbol");
   nodeBuffers = buildNodeBuffers(ctx, visibleNodes);
 
   const visibleNodeIds = new Set(visibleNodes.map((n) => n.id));
@@ -247,7 +245,7 @@ function subtreeOf(rootId: string): string[] {
 function hitTestVisible(px: number, py: number): NodeState | null {
   const nodes = currentTier === 0
     ? store.all().filter((n) => n.kind === "module")
-    : store.all();
+    : store.all().filter((n) => n.kind !== "symbol");
   return hitTest(viewport, nodes, px, py);
 }
 
@@ -548,8 +546,12 @@ function drawOverlay(): void {
   c2d.fillText(statusLine(), 8, 8);
 
   // Module labels — always visible. At tier 0 they're the only identity
-  // signal; at tier 1+ they label the module boxes that wrap files.
+  // signal; at tier 1 they label the module boxes that wrap files.
   drawModuleLabels();
+  if (currentTier >= 1) drawFileLabels();
+  // Floating symbol popup appears when a file is selected and that file
+  // has any extracted symbols. Click off → setSelection(null) closes it.
+  drawSymbolPopup();
 
   // Re-layout button in the top-right.
   if (app.activeWorkspaceId) {
@@ -641,6 +643,151 @@ function drawModuleLabels(): void {
       c2d.fillText(`${errs}`, bx + badgePad, by + 7);
     }
   }
+}
+
+function drawFileLabels(): void {
+  const { ctx: c2d } = overlay;
+  const files = store.all().filter((n) => n.kind === "file");
+  for (const f of files) {
+    const widthPx = (f.width / (viewport.xMax - viewport.xMin)) * viewport.width;
+    const heightPx = (f.height / (viewport.yMax - viewport.yMin)) * viewport.height;
+    if (heightPx < 10 || widthPx < 40) continue;
+
+    // Font scales with on-screen box height — no cap — so labels grow
+    // proportionally with zoom. Lower bound keeps them readable at fit-to-
+    // screen; upper bound guards against filling the box with one line of
+    // text at extreme zoom (never more than ~60% of the box height).
+    const fontSize = Math.min(heightPx * 0.55, Math.max(10, heightPx * 0.45));
+    c2d.font = `${fontSize}px -apple-system, BlinkMacSystemFont, sans-serif`;
+    c2d.fillStyle = "rgba(240, 240, 240, 0.92)";
+    c2d.textAlign = "left";
+    c2d.textBaseline = "middle";
+
+    // Truncate if the label is wider than the box (common for long file
+    // paths when the user is barely zoomed in).
+    const maxTextWidth = widthPx - 12;
+    const label = truncate(c2d, f.name, maxTextWidth);
+
+    const centerY = dataToPixel(viewport, f.x, f.y + f.height / 2).py;
+    c2d.fillText(label, dataToPixel(viewport, f.x, f.y).px + 6, centerY);
+  }
+}
+
+function drawSymbolPopup(): void {
+  // Find the currently-selected file (if any).
+  const selected = store.all().find((n) => n.user_state === "selected");
+  if (!selected || selected.kind !== "file") return;
+
+  const symbols = store.all().filter((n) => n.kind === "symbol" && n.parent === selected.id);
+  if (symbols.length === 0) return;
+
+  const { ctx: c2d, canvas: c } = overlay;
+  const maxRows = Math.min(symbols.length, 16);
+  const rowH = 18;
+  const headerH = 22;
+  const paddingX = 10;
+  const paddingY = 6;
+
+  // Measure widest symbol label for panel sizing.
+  c2d.font = "11px -apple-system, BlinkMacSystemFont, sans-serif";
+  let maxTextW = c2d.measureText(selected.name).width;
+  for (const s of symbols.slice(0, maxRows)) {
+    const t = s.signature ? `${s.name} ${s.signature}` : s.name;
+    const w = c2d.measureText(t).width;
+    if (w > maxTextW) maxTextW = w;
+  }
+  const panelW = Math.min(380, Math.max(200, maxTextW + paddingX * 2));
+  const panelH = headerH + maxRows * rowH + paddingY * 2 + (symbols.length > maxRows ? rowH : 0);
+
+  // Anchor: right of the file, clamped inside the canvas.
+  const fileRight = dataToPixel(viewport, selected.x + selected.width, selected.y + selected.height);
+  let px = fileRight.px + 12;
+  let py = fileRight.py;
+  if (px + panelW + 8 > c.clientWidth) px = c.clientWidth - panelW - 8;
+  if (py + panelH + 8 > c.clientHeight) py = c.clientHeight - panelH - 8;
+  if (py < 8) py = 8;
+  if (px < 8) px = 8;
+
+  // Panel background
+  c2d.fillStyle = "rgba(25, 25, 25, 0.94)";
+  roundPill(c2d, px, py, panelW, panelH, 6);
+  c2d.strokeStyle = "rgba(255, 255, 255, 0.12)";
+  c2d.lineWidth = 1;
+  c2d.beginPath();
+  c2d.roundRect(px + 0.5, py + 0.5, panelW - 1, panelH - 1, 6);
+  c2d.stroke();
+
+  // Header (file name)
+  c2d.font = "11px -apple-system, BlinkMacSystemFont, sans-serif";
+  c2d.fillStyle = "rgba(220, 220, 220, 0.9)";
+  c2d.textAlign = "left";
+  c2d.textBaseline = "middle";
+  c2d.fillText(selected.name, px + paddingX, py + headerH / 2);
+
+  // Divider
+  c2d.strokeStyle = "rgba(255, 255, 255, 0.08)";
+  c2d.beginPath();
+  c2d.moveTo(px + paddingX, py + headerH);
+  c2d.lineTo(px + panelW - paddingX, py + headerH);
+  c2d.stroke();
+
+  // Symbol rows
+  c2d.font = "11px -apple-system, BlinkMacSystemFont, sans-serif";
+  let rowY = py + headerH + paddingY;
+  for (const s of symbols.slice(0, maxRows)) {
+    // Tiny colored dot indicating symbol kind.
+    const dotColor = dotColorForSymbol(s.symbol_kind);
+    c2d.fillStyle = dotColor;
+    c2d.beginPath();
+    c2d.arc(px + paddingX + 4, rowY + rowH / 2, 3, 0, Math.PI * 2);
+    c2d.fill();
+
+    // Name
+    c2d.fillStyle = "rgba(235, 235, 235, 0.95)";
+    c2d.fillText(s.name, px + paddingX + 14, rowY + rowH / 2);
+
+    // Signature, right-side, dim
+    if (s.signature) {
+      const maxSigWidth = panelW - paddingX * 2 - 14 - c2d.measureText(s.name).width - 6;
+      if (maxSigWidth > 40) {
+        const sigText = truncate(c2d, s.signature, maxSigWidth);
+        c2d.fillStyle = "rgba(170, 170, 170, 0.6)";
+        c2d.textAlign = "right";
+        c2d.fillText(sigText, px + panelW - paddingX, rowY + rowH / 2);
+        c2d.textAlign = "left";
+      }
+    }
+
+    rowY += rowH;
+  }
+
+  if (symbols.length > maxRows) {
+    c2d.fillStyle = "rgba(170, 170, 170, 0.55)";
+    c2d.fillText(`… and ${symbols.length - maxRows} more`, px + paddingX + 14, rowY + rowH / 2);
+  }
+}
+
+function dotColorForSymbol(kind: string | undefined): string {
+  switch (kind) {
+    case "function": return "rgba(90, 170, 140, 0.95)";
+    case "class": return "rgba(170, 130, 190, 0.95)";
+    case "interface": return "rgba(140, 140, 190, 0.95)";
+    case "type": return "rgba(130, 160, 175, 0.95)";
+    case "constant": return "rgba(160, 140, 110, 0.95)";
+    default: return "rgba(140, 140, 140, 0.9)";
+  }
+}
+
+function truncate(c2d: CanvasRenderingContext2D, s: string, maxWidth: number): string {
+  if (c2d.measureText(s).width <= maxWidth) return s;
+  const ell = "…";
+  let lo = 0, hi = s.length;
+  while (lo < hi) {
+    const mid = (lo + hi) >> 1;
+    if (c2d.measureText(s.slice(0, mid) + ell).width <= maxWidth) lo = mid + 1;
+    else hi = mid;
+  }
+  return s.slice(0, Math.max(0, lo - 1)) + ell;
 }
 
 function roundPill(c2d: CanvasRenderingContext2D, x: number, y: number, w: number, h: number, r: number): void {

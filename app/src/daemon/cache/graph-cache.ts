@@ -11,7 +11,10 @@ import type { NodeState } from "../../shared/node-state.js";
 import { atomicWrite } from "../persist/atomic-write.js";
 import { WORKSPACES_DIR, workspaceDataDir } from "../persist/paths.js";
 
-const SCHEMA_VERSION = 1;
+// Bumped to 2 in Stage 9: layout constants changed (module label area
+// removed, files centered with symmetric padding). Old caches invalidate
+// automatically so the next activation runs a fresh extraction.
+const SCHEMA_VERSION = 2;
 
 export interface CachedGraph {
   schema_version: number;

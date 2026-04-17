@@ -59,12 +59,13 @@ const HEALTH_BORDER: Record<Health, { r: number; g: number; b: number; a: number
 
 const SELECTION_BORDER = { r: 1.0, g: 1.0, b: 1.0, a: 1.0 };
 
-// Halo padding fraction, relative to the node's larger dimension. Leaf
-// nodes (files, symbols) get a generous halo so the signal reads clearly
-// even when they're small; modules, which are already large, get a
-// restrained halo so the aggregate glow doesn't dwarf their contents.
+// Halo padding. Leaves (files, symbols) use a fraction of their larger
+// dimension so small nodes still get a generous attention-grabbing glow.
+// Modules use a fixed absolute thickness so every module's halo reads
+// the same no matter its size — a tall 42-file App module and a short
+// 5-file Root module get the same visible glow ring.
 const HALO_PAD_FRAC_LEAF = 0.22;
-const HALO_PAD_FRAC_MODULE = 0.04;
+const HALO_PAD_MODULE_ABS = 0.18;
 // Border ring thickness rendered as a frame of quads around the node.
 const BORDER_THICK = 0.04;
 
@@ -116,8 +117,9 @@ export function buildNodeBuffers(ctx: GLContext, nodes: NodeState[]): NodeBuffer
       : undefined;
     const halo = haloIntent ? HALO_BY_INTENT[haloIntent] : null;
     if (halo) {
-      const padFrac = n.kind === "module" ? HALO_PAD_FRAC_MODULE : HALO_PAD_FRAC_LEAF;
-      const pad = Math.max(n.width, n.height) * padFrac;
+      const pad = n.kind === "module"
+        ? HALO_PAD_MODULE_ABS
+        : Math.max(n.width, n.height) * HALO_PAD_FRAC_LEAF;
       // Modules get a dimmer halo so the aggregate signal doesn't
       // overwhelm leaf-level halos when zoomed in.
       const alphaMul = n.kind === "module" ? 0.55 : 1;
@@ -188,6 +190,18 @@ export function nodeDraws(ctx: GLContext, bufs: NodeBuffers): { vao: WebGLVertex
 
 function colorForNode(n: NodeState): { r: number; g: number; b: number; a: number } {
   if (n.kind === "module") return { ...MODULE_FILL };
+  if (n.kind === "symbol") {
+    // Symbols take a muted tint derived from their kind so the file body
+    // around them still reads as the primary visual unit.
+    switch (n.symbol_kind) {
+      case "function": return { r: 0.30, g: 0.55, b: 0.45, a: 1.0 };
+      case "class": return { r: 0.55, g: 0.40, b: 0.60, a: 1.0 };
+      case "interface": return { r: 0.45, g: 0.45, b: 0.60, a: 1.0 };
+      case "type": return { r: 0.40, g: 0.50, b: 0.55, a: 1.0 };
+      case "constant": return { r: 0.50, g: 0.45, b: 0.35, a: 1.0 };
+      default: return { r: 0.40, g: 0.40, b: 0.40, a: 1.0 };
+    }
+  }
   const palette = n.language ? LANGUAGE_FILL[n.language] ?? DEFAULT_FILL : DEFAULT_FILL;
   return { r: palette.r, g: palette.g, b: palette.b, a: 1.0 };
 }
