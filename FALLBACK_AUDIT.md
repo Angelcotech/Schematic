@@ -233,4 +233,27 @@ No new silent fallbacks. Re-layout clears both cache and positions.json determin
 
 ---
 
+## Stage 8 scan
+
+**Date:** 2026-04-17
+**Scope:** `frontend/src/graph/aggregation.ts` (new), updates to `frontend/src/graph/node-renderer.ts` and `frontend/src/main.ts`.
+
+**Commands used:**
+```
+rg 'catch\s*[\({]|try\s*\{|fallback|retry' frontend/src/graph/aggregation.ts
+rg '\?\?\s' frontend/src/graph/aggregation.ts
+```
+
+**Findings:**
+
+| Location | Pattern | Decision |
+|----------|---------|----------|
+| `aggregation.ts:32` | `childrenByParent.get(m.id) ?? []` | **Justified.** A module with no children legitimately has an empty child set. |
+| `aggregation.ts:42` | `c.ai_intent_since ?? 0` | **Justified.** Nodes without timestamps sort last; not a fallback hiding missing data. |
+| `main.ts` tier/LOD logic | none relevant | Stage 8 LOD is purely geometric — no silent fallbacks. |
+
+**Outcome:** 0 silent fallbacks introduced.
+
+---
+
 _(future stages appended here)_

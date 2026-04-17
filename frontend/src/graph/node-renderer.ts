@@ -7,6 +7,7 @@
 
 import type { AiIntent, Health, NodeState } from "@shared/index.js";
 import type { GLContext } from "../webgl/renderer.js";
+import type { NodeStateWithHalo } from "./aggregation.js";
 
 interface Rect {
   x: number; y: number; w: number; h: number;
@@ -58,8 +59,12 @@ const HEALTH_BORDER: Record<Health, { r: number; g: number; b: number; a: number
 
 const SELECTION_BORDER = { r: 1.0, g: 1.0, b: 1.0, a: 1.0 };
 
-// Halo inflates the rectangle by this fraction of its larger dimension on each side.
-const HALO_PAD_FRAC = 0.22;
+// Halo padding fraction, relative to the node's larger dimension. Leaf
+// nodes (files, symbols) get a generous halo so the signal reads clearly
+// even when they're small; modules, which are already large, get a
+// restrained halo so the aggregate glow doesn't dwarf their contents.
+const HALO_PAD_FRAC_LEAF = 0.22;
+const HALO_PAD_FRAC_MODULE = 0.04;
 // Border ring thickness rendered as a frame of quads around the node.
 const BORDER_THICK = 0.04;
 
@@ -101,16 +106,27 @@ export function buildNodeBuffers(ctx: GLContext, nodes: NodeState[]): NodeBuffer
   for (const n of nodes) {
     const fillColor = colorForNode(n);
 
-    // Halo (if any) — scales with node size so it's visible at any zoom.
-    const halo = HALO_BY_INTENT[n.ai_intent];
+    // Halo — leaf nodes use their own ai_intent. Modules at tier 0 roll up
+    // their most-recently-active child's intent via aggregation. Either way
+    // we look up in HALO_BY_INTENT.
+    const withHalo = n as NodeStateWithHalo;
+    const haloIntent: AiIntent | undefined =
+      n.ai_intent !== "idle" ? n.ai_intent
+      : n.kind === "module" && withHalo._aggregatedHaloIntent ? withHalo._aggregatedHaloIntent
+      : undefined;
+    const halo = haloIntent ? HALO_BY_INTENT[haloIntent] : null;
     if (halo) {
-      const pad = Math.max(n.width, n.height) * HALO_PAD_FRAC;
+      const padFrac = n.kind === "module" ? HALO_PAD_FRAC_MODULE : HALO_PAD_FRAC_LEAF;
+      const pad = Math.max(n.width, n.height) * padFrac;
+      // Modules get a dimmer halo so the aggregate signal doesn't
+      // overwhelm leaf-level halos when zoomed in.
+      const alphaMul = n.kind === "module" ? 0.55 : 1;
       writeRectTriangles(haloVerts, {
         x: n.x - pad,
         y: n.y - pad,
         w: n.width + pad * 2,
         h: n.height + pad * 2,
-        r: halo.r, g: halo.g, b: halo.b, a: halo.a,
+        r: halo.r, g: halo.g, b: halo.b, a: halo.a * alphaMul,
       });
     }
 
@@ -121,13 +137,23 @@ export function buildNodeBuffers(ctx: GLContext, nodes: NodeState[]): NodeBuffer
     });
 
     // Border: selection wins over health (selection is a loud user signal).
+    // Modules with aggregated errors get a red border as a glance signal.
     const healthBorder = HEALTH_BORDER[n.health];
+    const aggErr = n.aggregated_health?.error ?? 0;
+    const aggWarn = n.aggregated_health?.warning ?? 0;
+    const moduleAggBorder =
+      n.kind === "module" && aggErr > 0 ? HEALTH_BORDER["error"]
+      : n.kind === "module" && aggWarn > 0 ? HEALTH_BORDER["warning"]
+      : null;
     if (n.user_state === "selected") {
       writeRectBorder(borderVerts,
         { x: n.x, y: n.y, w: n.width, h: n.height, ...SELECTION_BORDER }, BORDER_THICK);
     } else if (healthBorder) {
       writeRectBorder(borderVerts,
         { x: n.x, y: n.y, w: n.width, h: n.height, ...healthBorder }, BORDER_THICK);
+    } else if (moduleAggBorder) {
+      writeRectBorder(borderVerts,
+        { x: n.x, y: n.y, w: n.width, h: n.height, ...moduleAggBorder }, BORDER_THICK * 0.7);
     } else if (n.kind === "module") {
       writeRectBorder(borderVerts,
         { x: n.x, y: n.y, w: n.width, h: n.height, ...MODULE_BORDER }, BORDER_THICK * 0.5);

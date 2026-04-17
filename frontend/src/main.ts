@@ -14,6 +14,7 @@ import {
   resizeOverlay,
 } from "./webgl/overlayLayer.js";
 import {
+  dataToPixel,
   fitToBounds,
   panBy,
   pixelToData,
@@ -33,6 +34,7 @@ import {
   type EdgeBuffer,
 } from "./graph/edge-renderer.js";
 import { hitTest } from "./graph/hit-test.js";
+import { aggregateActivity } from "./graph/aggregation.js";
 import { GraphStore } from "./state/graph-store.js";
 import { DaemonWSClient, type ConnectionState } from "./state/ws-client.js";
 
@@ -58,16 +60,87 @@ let edges: Edge[] = [];
 let nodeBuffers: NodeBuffers = buildNodeBuffers(ctx, []);
 let edgeBuffer: EdgeBuffer | null = null;
 
+// --- Zoom-tier LOD ---
+// Tier 0: only modules visible. File → file edges collapse into
+//         module → module aggregated edges with thickness = count.
+// Tier 1+: everything visible, raw edges.
+// Threshold: if files would render smaller than MIN_FILE_PIXELS on screen,
+// drop to tier 0.
+const MIN_FILE_PIXELS = 55;
+
+function computeTier(): 0 | 1 {
+  const allNodes = store.all();
+  const files = allNodes.filter((n) => n.kind === "file");
+  if (files.length === 0) return 1;
+  const visibleDataWidth = viewport.xMax - viewport.xMin;
+  if (visibleDataWidth <= 0) return 1;
+  // Use the smallest file width as the signal — if *any* file is too small
+  // to be legible, pull back to module-only tier.
+  const minFileW = Math.min(...files.map((f) => f.width));
+  const screenW = (minFileW / visibleDataWidth) * canvas.clientWidth;
+  return screenW >= MIN_FILE_PIXELS ? 1 : 0;
+}
+
+function aggregateEdgesByModule(rawEdges: Edge[], nodes: NodeState[]): Edge[] {
+  const parentOf = new Map<string, string>();
+  for (const n of nodes) if (n.parent) parentOf.set(n.id, n.parent);
+  const counts = new Map<string, number>();
+  for (const e of rawEdges) {
+    const srcMod = parentOf.get(e.source);
+    const dstMod = parentOf.get(e.target);
+    if (!srcMod || !dstMod) continue;
+    if (srcMod === dstMod) continue; // intra-module edges don't cross boundaries
+    const key = `${srcMod}|${dstMod}`;
+    counts.set(key, (counts.get(key) ?? 0) + 1);
+  }
+  const out: Edge[] = [];
+  for (const [key, count] of counts) {
+    const sep = key.indexOf("|");
+    out.push({
+      source: key.slice(0, sep),
+      target: key.slice(sep + 1),
+      kind: "import",
+      highlighted: false,
+      weight: count,
+    });
+  }
+  return out;
+}
+
+let currentTier: 0 | 1 = 1;
+
 function rebuildBuffers(): void {
   destroyNodeBuffers(ctx, nodeBuffers);
   destroyEdgeBuffer(ctx, edgeBuffer);
-  const nodes = store.all();
-  nodeBuffers = buildNodeBuffers(ctx, nodes);
-  // Filter edges whose endpoints are both in the node set (defensive —
-  // edges may reference nodes removed between fetches).
-  const nodeIds = new Set(nodes.map((n) => n.id));
-  const liveEdges = edges.filter((e) => nodeIds.has(e.source) && nodeIds.has(e.target));
-  edgeBuffer = buildEdgeBuffer(ctx, nodes, liveEdges);
+  const allNodes = store.all();
+
+  // Roll up leaf state into module aggregates so the renderer can glow
+  // modules whose children are active.
+  aggregateActivity(allNodes);
+
+  const tier = computeTier();
+  currentTier = tier;
+
+  const visibleNodes = tier === 0
+    ? allNodes.filter((n) => n.kind === "module")
+    : allNodes;
+  nodeBuffers = buildNodeBuffers(ctx, visibleNodes);
+
+  const visibleNodeIds = new Set(visibleNodes.map((n) => n.id));
+  const edgesToShow = tier === 0
+    ? aggregateEdgesByModule(edges, allNodes)
+    : edges.filter((e) => visibleNodeIds.has(e.source) && visibleNodeIds.has(e.target));
+  edgeBuffer = buildEdgeBuffer(ctx, visibleNodes, edgesToShow);
+}
+
+// Track whether the tier has crossed a threshold since the last frame so
+// we can trigger a cheap buffer rebuild only when needed (zoom in/out is
+// the common case that changes which buffer set is right).
+function maybeRebuildForTier(): void {
+  const tier = computeTier();
+  if (tier !== currentTier) {
+    rebuildBuffers();
+  }
 }
 
 // --- Viewport ---
@@ -171,6 +244,13 @@ function subtreeOf(rootId: string): string[] {
   return [rootId, ...root.children];
 }
 
+function hitTestVisible(px: number, py: number): NodeState | null {
+  const nodes = currentTier === 0
+    ? store.all().filter((n) => n.kind === "module")
+    : store.all();
+  return hitTest(viewport, nodes, px, py);
+}
+
 canvas.addEventListener("mousedown", (e) => {
   didDrag = false;
   dragStartScreenX = e.clientX;
@@ -181,7 +261,7 @@ canvas.addEventListener("mousedown", (e) => {
   const rect = canvas.getBoundingClientRect();
   const px = e.clientX - rect.left;
   const py = e.clientY - rect.top;
-  const hit = hitTest(viewport, store.all(), px, py);
+  const hit = hitTestVisible(px, py);
 
   // Only modules are draggable in v1. Files/symbols still select on click.
   if (hit && hit.kind === "module") {
@@ -229,7 +309,7 @@ window.addEventListener("mouseup", (e) => {
     const rect = canvas.getBoundingClientRect();
     const px = e.clientX - rect.left;
     const py = e.clientY - rect.top;
-    const hit = hitTest(viewport, store.all(), px, py);
+    const hit = hitTestVisible(px, py);
     setSelection(hit ? hit.id : null);
     return;
   }
@@ -287,7 +367,7 @@ window.addEventListener("mousemove", (e) => {
   }
 
   if (cursorPx >= 0 && cursorPx <= viewport.width && cursorPy >= 0 && cursorPy <= viewport.height) {
-    const hit = hitTest(viewport, store.all(), cursorPx, cursorPy);
+    const hit = hitTestVisible(cursorPx, cursorPy);
     setHover(hit ? hit.id : null);
   } else {
     setHover(null);
@@ -448,6 +528,7 @@ function requestFrame(): void {
   frameQueued = true;
   requestAnimationFrame(() => {
     frameQueued = false;
+    maybeRebuildForTier();
     const draws = [
       ...(edgeBuffer ? edgeDraw(ctx, edgeBuffer) : []),
       ...nodeDraws(ctx, nodeBuffers),
@@ -465,6 +546,10 @@ function drawOverlay(): void {
   c2d.textAlign = "left";
   c2d.textBaseline = "top";
   c2d.fillText(statusLine(), 8, 8);
+
+  // Module labels — always visible. At tier 0 they're the only identity
+  // signal; at tier 1+ they label the module boxes that wrap files.
+  drawModuleLabels();
 
   // Re-layout button in the top-right.
   if (app.activeWorkspaceId) {
@@ -494,6 +579,84 @@ function drawOverlay(): void {
       drawTooltip(overlay, cursorPx, cursorPy, metric === "" ? [n.name] : [n.name, metric]);
     }
   }
+}
+
+function drawModuleLabels(): void {
+  const { ctx: c2d } = overlay;
+  const modules = store.all().filter((n) => n.kind === "module");
+  for (const m of modules) {
+    const topLeftPx = dataToPixel(viewport, m.x, m.y + m.height);
+    const wPx = (m.width / (viewport.xMax - viewport.xMin)) * viewport.width;
+
+    // Font size scales with the module's on-screen width. At tier 0 modules
+    // are the only visible identity, so we give them a big legible label;
+    // at tier 1+ the size damps so labels sit cleanly above the module.
+    const minFontSize = currentTier === 0 ? 14 : 11;
+    const maxFontSize = currentTier === 0 ? 30 : 15;
+    const fontSize = Math.min(maxFontSize, Math.max(minFontSize, wPx / 9));
+    c2d.font = `${fontSize}px -apple-system, BlinkMacSystemFont, sans-serif`;
+
+    // Header bar drawn ABOVE the module rectangle so it never overlaps
+    // files inside. Rounded dark pill with text inside; error badge on
+    // the same bar, right-aligned.
+    const labelText = m.name;
+    const textW = c2d.measureText(labelText).width;
+    const padX = 8;
+    const padY = 4;
+    const headerH = fontSize + padY * 2;
+    const gap = 4;
+
+    const errs = m.aggregated_health?.error ?? 0;
+    c2d.font = "10px -apple-system, BlinkMacSystemFont, sans-serif";
+    const errTextW = errs > 0 ? c2d.measureText(`${errs}`).width : 0;
+    const badgePad = 4;
+    const badgeW = errs > 0 ? errTextW + badgePad * 2 : 0;
+    const badgeGap = errs > 0 ? 6 : 0;
+
+    const barW = textW + padX * 2 + badgeGap + badgeW;
+    const barX = topLeftPx.px;
+    const barY = topLeftPx.py - headerH - gap;
+
+    // Pill background
+    c2d.fillStyle = currentTier === 0 ? "rgba(40, 40, 40, 0.92)" : "rgba(30, 30, 30, 0.82)";
+    roundPill(c2d, barX, barY, barW, headerH, 4);
+
+    // Label
+    c2d.font = `${fontSize}px -apple-system, BlinkMacSystemFont, sans-serif`;
+    c2d.fillStyle = currentTier === 0 ? "rgba(235, 235, 235, 0.98)" : "rgba(220, 220, 220, 0.92)";
+    c2d.textAlign = "left";
+    c2d.textBaseline = "middle";
+    c2d.fillText(labelText, barX + padX, barY + headerH / 2);
+
+    // Error badge inside the same bar
+    if (errs > 0) {
+      const bx = barX + padX + textW + badgeGap;
+      const by = barY + (headerH - 14) / 2;
+      c2d.fillStyle = "rgba(200, 60, 50, 0.95)";
+      roundPill(c2d, bx, by, badgeW, 14, 3);
+      c2d.fillStyle = "#fff";
+      c2d.font = "10px -apple-system, BlinkMacSystemFont, sans-serif";
+      c2d.textAlign = "left";
+      c2d.textBaseline = "middle";
+      c2d.fillText(`${errs}`, bx + badgePad, by + 7);
+    }
+  }
+}
+
+function roundPill(c2d: CanvasRenderingContext2D, x: number, y: number, w: number, h: number, r: number): void {
+  const rr = Math.min(r, h / 2);
+  c2d.beginPath();
+  c2d.moveTo(x + rr, y);
+  c2d.lineTo(x + w - rr, y);
+  c2d.quadraticCurveTo(x + w, y, x + w, y + rr);
+  c2d.lineTo(x + w, y + h - rr);
+  c2d.quadraticCurveTo(x + w, y + h, x + w - rr, y + h);
+  c2d.lineTo(x + rr, y + h);
+  c2d.quadraticCurveTo(x, y + h, x, y + h - rr);
+  c2d.lineTo(x, y + rr);
+  c2d.quadraticCurveTo(x, y, x + rr, y);
+  c2d.closePath();
+  c2d.fill();
 }
 
 function drawRelayoutButton(): void {
