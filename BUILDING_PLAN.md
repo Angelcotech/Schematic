@@ -887,6 +887,18 @@ Phase boundaries are approval gates. Each phase ends with a working demo.
 
 ---
 
+## 14b. Build Laws
+
+Governing the *how* of construction, not the *what*. Applied to every stage.
+
+1. **Hardwire connections when reasonable.** Default to static imports, direct function calls, and typed messages. No dynamic dispatch, no plugin registries, no string-based event buses unless the flexibility is immediately required today. Consistent with the existing GammaGate discipline.
+
+2. **Scan for fallbacks after each phase.** After every stage, explicitly audit the code for fallback patterns — try-catch-swallow, silent defaults, retry loops, auto-selection between code paths, "if A fails call B" safety nets. Fallbacks mask real failures with "it just works somehow," which is the opposite of hardwired behavior. Each fallback found is either removed or explicitly justified with a written reason. Log every scan in `FALLBACK_AUDIT.md`.
+
+3. **Connection record.** Maintain `CONNECTIONS.md` as a living registry. Every component: home, inputs, outputs, dependencies, consumers. Every piece has a direction and a home. Before wiring, check the registry. After wiring, update it. The registry is part of the "done" of every sub-step.
+
+---
+
 ## 15. Design Invariants (non-negotiable)
 
 These must remain true no matter how the design evolves:
