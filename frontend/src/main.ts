@@ -3,6 +3,7 @@
 // reads from it. Stage 2's mock graph is still around in mock-graph.ts as a
 // reference but is no longer loaded here.
 
+import type { Edge } from "@shared/edge.js";
 import type { NodeState } from "@shared/node-state.js";
 import type { Workspace } from "@shared/workspace.js";
 import { initGL, resizeCanvas, render } from "./webgl/renderer.js";
@@ -52,6 +53,7 @@ const ctx = initGL(canvas);
 const overlay = createOverlay(container);
 
 const store = new GraphStore();
+let edges: Edge[] = [];
 
 let nodeBuffers: NodeBuffers = buildNodeBuffers(ctx, []);
 let edgeBuffer: EdgeBuffer | null = null;
@@ -61,7 +63,11 @@ function rebuildBuffers(): void {
   destroyEdgeBuffer(ctx, edgeBuffer);
   const nodes = store.all();
   nodeBuffers = buildNodeBuffers(ctx, nodes);
-  edgeBuffer = buildEdgeBuffer(ctx, nodes, []); // no edges in bootstrap mode
+  // Filter edges whose endpoints are both in the node set (defensive —
+  // edges may reference nodes removed between fetches).
+  const nodeIds = new Set(nodes.map((n) => n.id));
+  const liveEdges = edges.filter((e) => nodeIds.has(e.source) && nodeIds.has(e.target));
+  edgeBuffer = buildEdgeBuffer(ctx, nodes, liveEdges);
 }
 
 // --- Viewport ---
@@ -114,15 +120,22 @@ function setSelection(nodeId: string | null): void {
 }
 
 // --- Workspace + connection state (rendered in the status line) ---
+interface ExtractionProgress {
+  phase: string;
+  processed: number;
+  total: number;
+}
 interface AppState {
   workspaces: Workspace[];
   activeWorkspaceId: string | null;
   connection: ConnectionState;
+  progress: ExtractionProgress | null;
 }
 const app: AppState = {
   workspaces: [],
   activeWorkspaceId: null,
   connection: "closed",
+  progress: null,
 };
 
 // --- Event wiring ---
@@ -247,13 +260,15 @@ function drawOverlay(): void {
   c2d.textBaseline = "top";
   c2d.fillText(statusLine(), 8, 8);
 
-  if (store.all().length === 0) {
+  if (app.progress && app.progress.phase !== "ready") {
+    drawProgressOverlay(app.progress);
+  } else if (store.all().length === 0) {
     c2d.font = "12px -apple-system, BlinkMacSystemFont, sans-serif";
     c2d.fillStyle = "rgba(200, 200, 200, 0.35)";
     c2d.textAlign = "center";
     c2d.textBaseline = "middle";
     c2d.fillText(
-      "waiting for Claude Code activity…",
+      "no active workspace — run `schematic activate` in a repo",
       overlay.canvas.clientWidth / 2,
       overlay.canvas.clientHeight / 2,
     );
@@ -266,6 +281,30 @@ function drawOverlay(): void {
       drawTooltip(overlay, cursorPx, cursorPy, metric === "" ? [n.name] : [n.name, metric]);
     }
   }
+}
+
+function drawProgressOverlay(p: ExtractionProgress): void {
+  const { ctx: c2d, canvas: c } = overlay;
+  const cx = c.clientWidth / 2;
+  const cy = c.clientHeight / 2;
+  c2d.font = "13px -apple-system, BlinkMacSystemFont, sans-serif";
+  c2d.fillStyle = "rgba(220, 220, 220, 0.85)";
+  c2d.textAlign = "center";
+  c2d.textBaseline = "middle";
+  const label = p.total > 0
+    ? `Indexing workspace — ${p.phase} ${p.processed} / ${p.total}`
+    : `Indexing workspace — ${p.phase}`;
+  c2d.fillText(label, cx, cy - 8);
+
+  const barW = 280;
+  const barH = 4;
+  const barX = cx - barW / 2;
+  const barY = cy + 8;
+  const frac = p.total > 0 ? Math.min(1, p.processed / p.total) : 0;
+  c2d.fillStyle = "rgba(255, 255, 255, 0.1)";
+  c2d.fillRect(barX, barY, barW, barH);
+  c2d.fillStyle = "rgba(212, 169, 58, 0.9)";
+  c2d.fillRect(barX, barY, barW * frac, barH);
 }
 
 function statusLine(): string {
@@ -302,9 +341,7 @@ async function bootstrap(): Promise<void> {
   app.activeWorkspaceId = chosen ? chosen.id : null;
 
   if (chosen) {
-    const initial = await fetchWorkspaceNodes(chosen.id);
-    store.replaceAll(initial);
-    if (initial.length > 0) fitToCurrentNodes();
+    await loadGraph(chosen.id);
   }
 
   const client = new DaemonWSClient({
@@ -313,6 +350,16 @@ async function bootstrap(): Promise<void> {
     onEvent: (event) => {
       if (event.type === "node.state_change") {
         store.applyEvent(event, app.activeWorkspaceId);
+      } else if (event.type === "workspace.extraction_progress") {
+        if (event.workspace_id === app.activeWorkspaceId) {
+          app.progress = { phase: event.phase, processed: event.processed, total: event.total };
+          requestFrame();
+        }
+      } else if (event.type === "workspace.graph_ready") {
+        if (event.workspace_id === app.activeWorkspaceId) {
+          app.progress = null;
+          void loadGraph(event.workspace_id);
+        }
       } else if (event.type === "workspace.activated" || event.type === "workspace.resumed") {
         // refresh workspaces list so status line reflects it
         void fetchWorkspaces().then((list) => { app.workspaces = list; requestFrame(); });
@@ -326,16 +373,24 @@ async function bootstrap(): Promise<void> {
   client.connect();
 }
 
+async function loadGraph(workspaceId: string): Promise<void> {
+  const graph = await fetchWorkspaceGraph(workspaceId);
+  edges = graph.edges;
+  store.replaceAll(graph.nodes);
+  if (graph.nodes.length > 0) fitToCurrentNodes();
+  requestFrame();
+}
+
 async function fetchWorkspaces(): Promise<Workspace[]> {
   const r = await fetch(`${DAEMON_ORIGIN}/workspaces`);
   if (!r.ok) throw new Error(`[schematic] /workspaces failed: ${r.status}`);
   return r.json() as Promise<Workspace[]>;
 }
 
-async function fetchWorkspaceNodes(id: string): Promise<NodeState[]> {
-  const r = await fetch(`${DAEMON_ORIGIN}/workspaces/${id}/nodes`);
-  if (!r.ok) throw new Error(`[schematic] /workspaces/${id}/nodes failed: ${r.status}`);
-  return r.json() as Promise<NodeState[]>;
+async function fetchWorkspaceGraph(id: string): Promise<{ nodes: NodeState[]; edges: Edge[] }> {
+  const r = await fetch(`${DAEMON_ORIGIN}/workspaces/${id}/graph`);
+  if (!r.ok) throw new Error(`[schematic] /workspaces/${id}/graph failed: ${r.status}`);
+  return r.json() as Promise<{ nodes: NodeState[]; edges: Edge[] }>;
 }
 
 resize();

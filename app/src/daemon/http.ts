@@ -13,10 +13,12 @@ import type { WorkspaceRegistry } from "./workspaces/registry.js";
 import type { WSBroadcaster } from "./ws.js";
 import { newWorkspace, route } from "./workspaces/router.js";
 import type { NodeStoreRegistry } from "./node-store.js";
+import type { ActivationManager } from "./workspaces/activate.js";
 
 export interface DaemonContext {
   registry: WorkspaceRegistry;
   nodeStores: NodeStoreRegistry;
+  activations: ActivationManager;
   ws: WSBroadcaster;
   startedAt: number;
   state: { eventCount: number };
@@ -78,6 +80,11 @@ export function createRequestHandler(
         const ws = newWorkspace(rootPath);
         await ctx.registry.create(ws);
         ctx.ws.broadcast({ type: "workspace.activated", workspace: ws, timestamp: Date.now() }, ws.id);
+        // Kick off extraction + watcher in the background. Progress + graph_ready
+        // events will broadcast as they occur.
+        void ctx.activations.activate(ws).catch((e) =>
+          console.error(`[schematic] activation failed for ${ws.name}:`, e),
+        );
         return json(res, 201, ws);
       }
 
@@ -94,6 +101,11 @@ export function createRequestHandler(
               ? "workspace.paused"
               : "workspace.disabled";
         ctx.ws.broadcast({ type: evType, workspace_id: ws.id, timestamp: Date.now() }, ws.id);
+        if (body.to === "active") {
+          void ctx.activations.activate(ws);
+        } else {
+          void ctx.activations.deactivate(ws.id);
+        }
         return json(res, 200, ws);
       }
 
@@ -102,18 +114,29 @@ export function createRequestHandler(
       if (method === "DELETE" && idMatch) {
         const id = idMatch[1];
         await ctx.registry.forget(id);
+        await ctx.activations.deactivate(id);
         ctx.nodeStores.drop(id);
         ctx.ws.broadcast({ type: "workspace.forgotten", workspace_id: id, timestamp: Date.now() }, id);
         return json(res, 200, { ok: true });
       }
 
-      // /workspaces/:id/nodes — GET current NodeState snapshot (lets a
-      // reconnecting browser bootstrap without waiting for new hook events).
+      // /workspaces/:id/nodes — legacy endpoint kept for Stage 5 back-compat.
       const nodesMatch = /^\/workspaces\/([^/]+)\/nodes$/.exec(path);
       if (method === "GET" && nodesMatch) {
         const id = nodesMatch[1];
         const store = ctx.nodeStores.get(id);
         return json(res, 200, store?.all() ?? []);
+      }
+
+      // /workspaces/:id/graph — full { nodes, edges } snapshot for the browser.
+      const graphMatch = /^\/workspaces\/([^/]+)\/graph$/.exec(path);
+      if (method === "GET" && graphMatch) {
+        const id = graphMatch[1];
+        const store = ctx.nodeStores.get(id);
+        return json(res, 200, {
+          nodes: store?.all() ?? [],
+          edges: store?.edges() ?? [],
+        });
       }
 
       if (method === "GET" && path === "/resolve") {
@@ -208,6 +231,11 @@ async function handleHook(ctx: DaemonContext, payload: HookPayload): Promise<Hoo
     ctx.ws.broadcast(
       { type: "workspace.activated", workspace, timestamp: Date.now() },
       workspace.id,
+    );
+    // Fire-and-forget extraction. The hook that triggered activation returns
+    // immediately; progress + graph_ready events arrive over WS.
+    void ctx.activations.activate(workspace).catch((e) =>
+      console.error(`[schematic] auto-activation extraction failed:`, e),
     );
   }
 

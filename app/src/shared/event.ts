@@ -21,4 +21,24 @@ export type SchematicEvent =
       node_id: string;
       node: NodeState | null;
       timestamp: number;
+    }
+  | {
+      // Streamed during extraction so the browser can show a progress bar.
+      type: "workspace.extraction_progress";
+      workspace_id: string;
+      phase: "walk" | "modules" | "imports" | "layout" | "ready";
+      processed: number;
+      total: number;
+      timestamp: number;
+    }
+  | {
+      // The daemon finished (re-)extracting and the stored graph changed.
+      // Browsers should re-fetch GET /workspaces/:id/graph to pick up the
+      // new structure. (We don't inline the graph in the event to keep WS
+      // frames small on bigger repos.)
+      type: "workspace.graph_ready";
+      workspace_id: string;
+      node_count: number;
+      edge_count: number;
+      timestamp: number;
     };

@@ -1,0 +1,7 @@
+{
+  "modules": {
+    "App": { "paths": ["app/**"] },
+    "Frontend": { "paths": ["frontend/**"] },
+    "Docs": { "paths": ["*.md"] }
+  }
+}

@@ -5,6 +5,7 @@ import { WSBroadcaster } from "./ws.js";
 import { createRequestHandler, type DaemonContext } from "./http.js";
 import { NodeStoreRegistry } from "./node-store.js";
 import { startDecayTick } from "./decay.js";
+import { ActivationManager } from "./workspaces/activate.js";
 
 export interface DaemonHandle {
   port: number;
@@ -22,15 +23,28 @@ export async function startDaemon(): Promise<DaemonHandle> {
   const httpServer = createServer();
   const ws = new WSBroadcaster(httpServer);
 
+  const activations = new ActivationManager(nodeStores, ws);
+
   const ctx: DaemonContext = {
     registry,
     nodeStores,
+    activations,
     ws,
     startedAt: Date.now(),
     state: { eventCount: 0 },
   };
 
   const stopDecay = startDecayTick(nodeStores, ws);
+
+  // Background: activate any already-active workspaces from the persisted
+  // registry. Uses the cache, so this is fast on restart.
+  for (const ws of registry.all()) {
+    if (ws.state === "active") {
+      void activations.activate(ws).catch((e) =>
+        console.error(`[schematic] startup activation failed for ${ws.name}:`, e),
+      );
+    }
+  }
 
   // requestShutdown lets the POST /shutdown handler trigger graceful stop.
   // Populated below after `stop` is defined.
@@ -49,6 +63,8 @@ export async function startDaemon(): Promise<DaemonHandle> {
   const stop = async (): Promise<void> => {
     console.log("[schematic] shutdown: stopping decay tick");
     stopDecay();
+    console.log("[schematic] shutdown: stopping fs watchers");
+    await activations.shutdown();
     console.log("[schematic] shutdown: closing ws clients");
     ws.close();
     console.log("[schematic] shutdown: closing http server");

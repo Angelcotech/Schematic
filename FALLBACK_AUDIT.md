@@ -179,4 +179,32 @@ rg '\?\?\s' app/src/daemon/node-store.ts frontend/src/state frontend/src/main.ts
 
 ---
 
+## Stage 6 scan
+
+**Date:** 2026-04-17
+**Scope:** new files under `app/src/daemon/extraction/`, `app/src/daemon/cache/`, `app/src/daemon/fs-watch/`, `app/src/daemon/workspaces/activate.ts`. Updates to `node-store.ts`, `http.ts`, `index.ts`, `shared/event.ts`. Frontend `main.ts` updated for graph/progress handling.
+
+**Commands used:**
+```
+rg 'catch\s*[\({]|try\s*\{|fallback|retry' app/src/daemon/{extraction,cache,fs-watch,workspaces/activate.ts}
+```
+
+**Findings:**
+
+| Location | Pattern | Decision |
+|----------|---------|----------|
+| `extraction/walker.ts:65-67` | try/catch around `readIgnoreFile` | **Justified.** ENOENT → null (no .gitignore / .schematic-ignore present). Other errors re-thrown. |
+| `extraction/imports.ts:29-31` | try/catch around source-file read | **Justified.** ENOENT → empty-imports return (a file was deleted between walk and parse — benign race). Other errors re-thrown. |
+| `extraction/modules.ts:20-23` | try/catch around `.schematic.json` read | **Justified.** ENOENT → null (falls back to directory-based module detection, which is the documented default). |
+| `cache/graph-cache.ts:29-32` | `sha256OfFile` ENOENT handling | **Justified.** Hash returns null for missing config files (tsconfig, package.json, .schematic.json all optional). The invalidation check compares nulls correctly. |
+| `cache/graph-cache.ts:53-59` | `readCache` error handling | **Justified.** ENOENT → null (no cache yet). Other errors → `console.warn` + return null, triggering a full re-extract. Not silent — the warning surfaces corruption. |
+| `workspaces/activate.ts:40` | try/finally for `inProgress` flag | **Justified.** Cleanup guard, not a fallback. |
+| `workspaces/activate.ts:45` | `.catch((e) => console.error(...))` on fs-change-triggered extraction | **Justified.** Fire-and-forget with loud logging. Extraction errors during fs watch don't crash the daemon but are visible in its stderr. |
+
+Also noted: imports.ts comment mentions "retry with TS source extensions" — descriptive text about substitution candidates, not a retry loop.
+
+**Outcome:** 0 silent fallbacks introduced. All new try/catch patterns are ENOENT-specific or explicit-logged recovery paths.
+
+---
+
 _(future stages appended here)_

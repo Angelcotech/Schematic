@@ -13,6 +13,9 @@
     "cli": "node dist/cli/index.js"
   },
   "dependencies": {
+    "chokidar": "^4.0.1",
+    "ignore": "^6.0.2",
+    "typescript": "^5.5.0",
     "ws": "^8.18.0"
   },
   "devDependencies": {

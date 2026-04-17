@@ -12,6 +12,7 @@ import type {
   NodeKind,
   NodeState,
 } from "../shared/node-state.js";
+import type { Edge } from "../shared/edge.js";
 import type { HookPayload } from "../shared/hook-payload.js";
 import type { Workspace } from "../shared/workspace.js";
 
@@ -112,13 +113,62 @@ interface NodeChange {
 
 export class WorkspaceNodeStore {
   private readonly nodes = new Map<string, NodeState>();
+  private edgesList: Edge[] = [];
 
   all(): NodeState[] {
     return Array.from(this.nodes.values());
   }
 
+  edges(): Edge[] {
+    return this.edgesList;
+  }
+
   get(id: string): NodeState | undefined {
     return this.nodes.get(id);
+  }
+
+  // Replace the graph with freshly-extracted data, preserving the
+  // hot/ephemeral state (ai_intent, user_state, mentions) that bootstrap
+  // hooks and user clicks have already accumulated.
+  applyExtractedGraph(nodes: NodeState[], edges: Edge[]): void {
+    const prevHot = new Map<string, Pick<NodeState,
+      "ai_intent" | "ai_intent_since" | "ai_intent_tool" | "ai_intent_session" |
+      "user_state" | "last_ai_touch" | "manually_positioned" | "x" | "y"
+    >>();
+    for (const n of this.nodes.values()) {
+      prevHot.set(n.id, {
+        ai_intent: n.ai_intent,
+        ai_intent_since: n.ai_intent_since,
+        ai_intent_tool: n.ai_intent_tool,
+        ai_intent_session: n.ai_intent_session,
+        user_state: n.user_state,
+        last_ai_touch: n.last_ai_touch,
+        manually_positioned: n.manually_positioned,
+        x: n.x,
+        y: n.y,
+      });
+    }
+
+    this.nodes.clear();
+    for (const n of nodes) {
+      const hot = prevHot.get(n.id);
+      if (hot) {
+        n.ai_intent = hot.ai_intent;
+        n.ai_intent_since = hot.ai_intent_since;
+        n.ai_intent_tool = hot.ai_intent_tool;
+        n.ai_intent_session = hot.ai_intent_session;
+        n.user_state = hot.user_state;
+        n.last_ai_touch = hot.last_ai_touch;
+        // Preserve manual positions across re-extraction per Invariant #6.
+        if (hot.manually_positioned) {
+          n.manually_positioned = true;
+          n.x = hot.x;
+          n.y = hot.y;
+        }
+      }
+      this.nodes.set(n.id, n);
+    }
+    this.edgesList = edges;
   }
 
   // Applies a hook event to node state, returns the change for broadcast

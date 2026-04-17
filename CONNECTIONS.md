@@ -237,10 +237,45 @@ Edges point from producer to consumer.
 
 ### Frontend graph store (`frontend/src/state/graph-store.ts`)
 - **Home:** `frontend/src/state/graph-store.ts`
-- **Inputs:** WS events, initial snapshot from GET /workspaces/:id/nodes
+- **Inputs:** WS events, initial snapshot from GET /workspaces/:id/graph
 - **Outputs:** Map of NodeState; `subscribe()` fires on any mutation
 - **Dependencies:** shared types
 - **Consumers:** `frontend/src/main.ts` (renderer reads `store.all()`)
+
+### Extraction pipeline (`daemon/extraction/`)
+- **Home:** `app/src/daemon/extraction/{walker,modules,imports,layout,extract}.ts`
+- **Inputs:** workspace root path, optional progress callback
+- **Outputs:** `ExtractedGraph` — nodes + edges + per-file `{mtime_ms, byte_size}`
+- **Dependencies:** `typescript` (AST parser), `ignore` (gitignore-style matching), shared types
+- **Behavior:**
+  - `walker.ts`: async directory walk, honors `.gitignore` + `.schematic-ignore` + built-in ignores (node_modules, dist, .git, .schematic, etc.); filters to a whitelist of text/code extensions.
+  - `modules.ts`: module detection — defaults to top-level-directory grouping, overridable via `.schematic.json` `modules` section.
+  - `imports.ts`: TS compiler API parses each source file; handles `import`/`export`/`import = require`/`import()`/`require()`. `linkImports` resolves relative specifiers to in-workspace node IDs with .js→.ts substitution for TypeScript projects.
+  - `layout.ts`: deterministic grid (modules in a horizontal row, files stacked inside each module). Stage 7 replaces with force-directed.
+  - `extract.ts`: orchestrator, emits progress events.
+- **Consumers:** `daemon/workspaces/activate.ts`
+
+### Graph cache (`daemon/cache/graph-cache.ts`)
+- **Home:** `app/src/daemon/cache/graph-cache.ts`
+- **Inputs:** workspace ID, extracted graph to persist; workspace root for config hashing
+- **Outputs:** `CachedGraph` (readCache), persisted `~/.schematic/workspaces/<id>/graph.json`
+- **Behavior:** SHA-256 of tsconfig.json, package.json, .schematic.json drives invalidation. Atomic writes via `atomic-write.ts`. Corrupt cache → warn + return null → triggers full re-extract.
+- **Consumers:** `daemon/workspaces/activate.ts`
+
+### FS watcher (`daemon/fs-watch/watcher.ts`)
+- **Home:** `app/src/daemon/fs-watch/watcher.ts`
+- **Inputs:** workspace root, batch callback
+- **Outputs:** coalesced `{added, changed, removed}` batches every ~150ms
+- **Dependencies:** `chokidar`
+- **Consumers:** `daemon/workspaces/activate.ts` (per-workspace watcher lifecycle)
+
+### Activation manager (`daemon/workspaces/activate.ts`)
+- **Home:** `app/src/daemon/workspaces/activate.ts`
+- **Inputs:** `Workspace` to activate/deactivate; events from the fs watcher
+- **Outputs:** broadcasts `workspace.extraction_progress` and `workspace.graph_ready`; mutates per-workspace node store via `applyExtractedGraph`
+- **Behavior:** cache-first activation (cache-hit restore → emitReady; cache-miss full extract → persist → emitReady). Starts per-workspace fs watcher; triggers full re-extract on any file change. `inProgress` guard prevents concurrent activations of the same workspace.
+- **Dependencies:** `extraction/extract`, `cache/graph-cache`, `fs-watch/watcher`, `node-store`, `ws`
+- **Consumers:** `daemon/index.ts` (startup activation), `daemon/http.ts` (POST /workspaces, state transitions, forget, auto-activation on hook)
 
 ---
 
@@ -289,3 +324,4 @@ _(to be recorded in Stage 11)_
 | 2026-04-17 | 3.1-3.8 | Daemon skeleton: app workspace scaffolding, HTTP (status/workspaces/hook), WebSocket (ready + event broadcast), workspace registry with 3-state machine, cwd router with marker-based auto-activation, config + atomic persistence, SIGTERM/SIGINT graceful shutdown. Shared types: Workspace, HookPayload, SchematicEvent, WS messages. |
 | 2026-04-17 | 4.1-4.8 | Install CLI. New daemon endpoints: POST /shutdown, POST /workspaces (create), POST /workspaces/:id/state, DELETE /workspaces/:id, GET /resolve. POST /hook now accepts CC-native payload shape and returns hookSpecificOutput for UserPromptSubmit. CLI: start/stop/restart/status, install/uninstall, workspaces list/forget, activate/pause/resume/disable, config get/set, log --tail. Install writes hook.mjs to ~/.schematic/hooks/ and idempotent Schematic-tagged entries to ~/.claude/settings.json. Live-tested end-to-end against real ~/.claude/settings.json (backed up + restored). |
 | 2026-04-17 | 5.1-5.7 | Hook wiring end-to-end. Daemon: NodeStoreRegistry + WorkspaceNodeStore (per-workspace NodeState map driven by hooks), startDecayTick broadcasts decay events at 10s cadence, POST /hook now also produces node.state_change events, new GET /workspaces/:id/nodes endpoint, CORS headers added so Vite dev origin can fetch. Frontend: DaemonWSClient with finite reconnect backoff, GraphStore subscribed to renderer, main.ts rewritten to drive from live store. Router bug fixed — `.schematic/` directory no longer a marker (conflicted with ~/.schematic/). Live-tested: CC edits reflect on canvas within ~100ms. |
+| 2026-04-17 | 6.1-6.13 | Full graph extraction + cache. Added `extraction/{walker,modules,imports,layout,extract}.ts`, `cache/graph-cache.ts`, `fs-watch/watcher.ts`, `workspaces/activate.ts`. Daemon now eagerly extracts the real graph (files + imports) for each active workspace, caches to disk with config-hash invalidation, and re-extracts on fs changes. New events: workspace.extraction_progress, workspace.graph_ready. New endpoint: GET /workspaces/:id/graph. WorkspaceNodeStore gained edges + applyExtractedGraph (preserves ai_intent + user_state + manual positions across re-extraction). Frontend shows progress bar during extraction and re-fetches graph on graph_ready. Deps added: typescript (runtime, AST parser), chokidar (fs watch), ignore (gitignore matching). `.schematic.json` committed at repo root with App/Frontend/Docs module definitions — self-hosting live. Self-verified: 72 nodes, 110 edges on Schematic's own repo. |
