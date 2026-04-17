@@ -146,7 +146,9 @@ interface Edge {
 | 40–80% | Files + symbols (exports) | 1k–10k |
 | 80%+ | All symbols + internal call edges | full detail |
 
-**Symbol extraction is lazy.** File-level parsing (imports) happens eagerly at graph-build time. Symbol-level parsing (functions, classes, call edges) runs on demand the first time a user zooms into a file, then caches.
+**Symbol extraction is eager with smart caching.** At first activation, the full graph — files, imports, symbols, call edges — is extracted in one pass, with progress streamed to the browser. The result is cached to disk on workspace pause/shutdown. Subsequent activations load the cache instantly (~100ms on a 3k-file graph); the daemon then walks the filesystem, diffs mtimes, and re-parses only changed files. Live edits during a session update incrementally via fs watchers. Rationale: zoom-to-symbol is always instant, the map always shows a complete picture, and the one-time first-extraction cost (~1–3 minutes on typical repos) amortizes across every future session.
+
+For very large repos (10k+ files), tiered readiness keeps things responsive: file-level extraction (tiers 0–2) finishes in ~10–20 seconds and becomes navigable while symbol + call-graph extraction (tier 3) continues in the background. Cache writes also happen when a repo is in `registered` state, so by the time the user clicks Activate, most of the work is already done.
 
 **Cross-layer edges auto-aggregate.** At Level 0 (modules only), all underlying file-to-file imports between two modules collapse into **one thick edge** between the module nodes, with `weight = count`. Hover → tooltip lists the underlying connections. As the user zooms in, aggregated edges dissolve into individual ones.
 
@@ -419,6 +421,66 @@ Activation of a large repo may take a few seconds to index. The daemon:
 - Health sources start only after `import_parse` completes (they need the graph to map diagnostics to)
 
 No blocking; no timeouts that bite on big repos.
+
+### Cache and incremental update
+
+The graph is **eager + cached**. Full extraction happens once per repo; subsequent sessions are near-instant.
+
+**Cache file schema** (`~/.schematic/workspaces/<id>/graph.json`):
+
+```json
+{
+  "schema_version": 1,
+  "workspace_id": "ws_f2a81c3d",
+  "extracted_at": 1744000000000,
+  "tsconfig_hash": "sha256:...",
+  "package_json_hash": "sha256:...",
+  "schematic_json_hash": "sha256:...",
+  "files": {
+    "src/engine/parser.ts": {
+      "mtime": 1743999000000,
+      "byte_size": 4821,
+      "content_hash": "sha256:..."
+    }
+  },
+  "nodes": [ /* full NodeState[] */ ],
+  "edges": [ /* full Edge[] */ ]
+}
+```
+
+**Invalidation rules** (evaluated at activation):
+
+| Trigger | Effect |
+|---------|--------|
+| `tsconfig.json` hash changed | Full symbol re-parse (types changed) |
+| `package.json` hash changed | Full symbol re-parse (dependencies changed) |
+| `.schematic.json` hash changed | Re-group modules, keep file/symbol graph |
+| File mtime newer than cache | Re-parse that file only (imports + symbols) |
+| File deleted | Drop its nodes + inbound edges |
+| File added | Parse fully, insert |
+| Cache `schema_version` bumped | Full re-parse |
+
+**Activation flow:**
+
+1. Load cache from disk (~100ms for 3k-file graph)
+2. Hash the three config files (tsconfig, package.json, .schematic.json), compare against cache
+3. If any differ → full re-parse. Otherwise → proceed.
+4. Walk filesystem, stat every tracked file (<1 second for ~3k files)
+5. Collect dirty files (mtime newer or content hash mismatch)
+6. Collect deleted files, collect new files
+7. Re-parse the dirty + new set (usually 0-10 files, <2 seconds)
+8. Apply diffs to the in-memory graph
+9. Broadcast `workspace.ready` with summary: `X files re-parsed, Y added, Z removed`
+10. Start health sources
+
+**Live updates (mid-session):** an `fs.watch` subscription per workspace catches changes as they happen. Save a file → parse it immediately, update the graph, broadcast the delta. No waiting for the next activation.
+
+**Cache persistence:**
+- Written atomically on workspace pause, disable, daemon shutdown
+- Also on a periodic flush (every 30 seconds of idle, coalesced)
+- Atomic: write to `graph.json.tmp` then rename, so a crash mid-write never corrupts the cache
+
+**Cache corruption recovery:** if the cache file is unreadable (truncated, wrong schema version, parse error), the daemon logs a warning, deletes the file, and runs a full re-extraction. No silent failures — the user sees a toast.
 
 ### Cross-repo edges (deferred to v2)
 
@@ -711,9 +773,10 @@ Remaining:
 - [ ] **`.schematic/` directory structure:** what lives inside? (Proposed: `local-positions.json`, `session-cache/`, user-specific cache — not checked in.)
 - [ ] **Cross-repo edges (v2):** exact config shape for declaring workspace dependencies. Deferred.
 - [ ] **Drift-metric notification (v1.5):** threshold formula for suggesting re-layout. Needs tuning with real graphs.
-- [ ] **Symbol-level mention extraction:** at tier 3, should `extractFeatures` in a prompt match the specific symbol, or the containing file? Leaning symbol when tier 3 is loaded, file otherwise.
+- [ ] **Symbol-level mention extraction:** at tier 3, should `extractFeatures` in a prompt match the specific symbol, or the containing file? With eager extraction, the symbol is always available — leaning "match the symbol, always."
 - [ ] **Editor jump integration:** side panel "jump to line" behavior. VS Code URL scheme? Configurable editor hook?
 - [ ] **Multi-session concurrency semantics:** if two CC sessions edit the same file concurrently, how do we render competing `ai_intent_session` states? Leaning: union of halos, tooltip shows session list.
+- [ ] **Tiered readiness threshold (v2):** at what file count do we switch from single-pass eager extraction to tier-0-2-first-then-tier-3-background? (Gut: 5,000 files.)
 
 ---
 
@@ -760,10 +823,12 @@ Phase boundaries are approval gates. Each phase ends with a working demo.
 - End-to-end demo: CC edits a file → hook POSTs to daemon → daemon routes to active workspace → broadcasts WS → browser node flashes yellow→green
 - Session-level attribution via `session_id`
 
-**Phase 4 — Graph extraction. First self-hosting milestone.**
-- Real graph from a target repo. Directory-based module detection, optional `.schematic.json` override, file-level import parsing.
-- Graph cached under workspace persistence
-- Initial-extraction progress streamed to browser (phased cadence)
+**Phase 4 — Full graph extraction + cache layer. First self-hosting milestone.**
+- Eager extraction: files, imports, symbols (TypeScript compiler API), call edges — all in one pass per activation
+- Directory-based module detection, optional `.schematic.json` override
+- Cache layer: atomic writes, version stamps, config-file hashing for invalidation, mtime-based incremental updates
+- fs watcher for live mid-session updates
+- Initial-extraction progress streamed to browser (phased cadence); tiered readiness for large repos (tiers 0–2 navigable while tier 3 finishes in background)
 - **Self-hosting target:** Schematic's own repo is indexed and rendered by the running daemon. From this point forward, Schematic is developed *using* Schematic.
 
 **Phase 5 — Manual layout.**
@@ -776,9 +841,11 @@ Phase boundaries are approval gates. Each phase ends with a working demo.
 - LOD culling, camera zoom thresholds, cross-layer edge aggregation
 - 4-level activity rollup from symbol → file → module → top
 
-**Phase 7 — Symbol-level.**
-- On-demand TypeScript compiler API extraction, tier-3 rendering
-- Call edges, symbol-level node state
+**Phase 7 — Tier-3 symbol rendering.**
+- With symbol + call-edge data already extracted in Phase 4, this phase is rendering only
+- Tier-3 node rendering (symbols as nodes within files)
+- Call-edge rendering between symbols, aggregation up to file-level edges at lower zoom
+- Symbol-level interactions (click a function, see its callers/callees via `arch_neighbors`)
 
 **Phase 8 — CC context integration.**
 - UserPromptSubmit hook injects `<arch-context>`
@@ -847,3 +914,5 @@ These must remain true no matter how the design evolves:
   - New **Design Invariant #9**: the user must always see whether the system is working.
 
 - **2026-04-16 (cont.)** — Development strategy decided: **Schematic is its own primary test target.** From Phase 4 (graph extraction) onward, every phase is validated against the Schematic repo itself. Self-hosting is the test suite. If Schematic can't usefully visualize Schematic, it can't ship.
+
+- **2026-04-16 (cont.)** — Extraction strategy flipped from lazy to **eager + cache**. Original "lazy symbol extraction on zoom" was premature optimization. New model: full graph (files + imports + symbols + call edges) extracted in one pass at first activation (~1–3 minutes on typical repos). Cached to disk on shutdown with config-file hashes and mtime index. Subsequent activations load cache instantly, walk filesystem, re-parse only dirty files (typically <2 seconds). Live updates via fs watcher during session. Phase 7 simplified to tier-3 rendering only — the data is already there. Tiered readiness (tiers 0–2 first, tier 3 background) deferred as v2 optimization for 10k+ file repos.
