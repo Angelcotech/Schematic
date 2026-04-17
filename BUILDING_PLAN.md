@@ -93,19 +93,18 @@ interface NodeState {
   layout_locked: boolean;         // optional: prevent accidental drags
 
   // AI intent (ephemeral)
-  ai_intent: "idle" | "planning" | "editing" | "modified" | "deleted" | "failed";
+  ai_intent: "idle" | "reading" | "planning" | "modified" | "deleted" | "failed";
   ai_intent_since?: number;
-  ai_intent_tool?: string;        // "Edit" | "Write" | "Bash rm" | ...
+  ai_intent_tool?: string;        // "Edit" | "Write" | "Read" | "Grep" | "Bash rm" | ...
   ai_intent_session?: string;     // CC session_id that owns this intent
 
   // User interaction (ephemeral)
-  user_state: "none" | "hovered" | "selected" | "pinned";
-  user_multi_selected: boolean;
+  user_state: "none" | "hovered" | "selected";
+  // (user_multi_selected cut — multi-select deferred to v1.5)
 
   // Focus (ephemeral)
   in_arch_context: boolean;       // currently injected into CC prompts
-  last_mention_ts?: number;       // timestamp of most recent mention in conversation
-  last_mention_source?: "user" | "ai";
+  // (last_mention_ts / last_mention_source cut — mention extraction replaced by "reading" ai_intent)
 
   // Aggregated state (for parents — rolled up from descendants)
   aggregated_ai_intent: "idle" | "active";
@@ -297,17 +296,16 @@ Tools are layer-aware: queries resolve at the granularity of the node ID passed 
 - Prepends `<arch-context>` to the prompt with current focus and diagnostics
 - CC sees the user's spatial focus automatically, every turn, without being told
 
-### Conversation mention extraction
+### "CC activity" signal (replaces mention extraction)
 
-Both sides of the conversation feed mentions into node state:
+The Aho-Corasick mention extraction was cut in the 2026-04-17 discipline pass. For a reference surface showing "what CC is doing," CC's actual tool calls are the ground truth signal — user intent in advance of CC action is a speculative extra channel we don't need.
 
-**User-side (UserPromptSubmit hook):** tokenize the incoming prompt, run a single-pass Aho-Corasick automaton over the node-name index (paths, basenames, module names, symbol names). Matches update `last_mention_ts` and `last_mention_source = "user"`.
+Instead: `PreToolUse` hooks set `ai_intent` on the targeted node to one of:
+- `"reading"` on `Read`, `Grep`, `Glob`
+- `"planning"` on `Edit`, `Write`
+- Then `PostToolUse` transitions to `"modified"` / `"failed"` / `"deleted"`
 
-**CC-side (PreToolUse hook):** every CC tool call that includes a path (Edit, Write, Read, Grep, Glob, Bash with file args) is a mention of that node. No text parsing needed — tool inputs are ground truth of what CC is working with.
-
-Both run automatically. No CC cognition required. The Aho-Corasick index is built at graph-build time and updated incrementally when nodes are added/removed.
-
-**Ambiguity handling:** exact basename → full weight. Partial match → lower weight. Multiple candidates → rank by recency (recent nodes win) and AI/user activity (already-focused nodes win), pick top N with reduced weight each.
+No prompt scanning, no Aho-Corasick index, no two-sided extraction. The renderer reads a single field and composes visuals.
 
 ### Why claude-in-chrome is NOT in this architecture
 
@@ -562,12 +560,13 @@ A clean module looks clean at a glance; a broken module is visually loud without
 
 If a source stops emitting (process crashed, watcher died), affected nodes revert to `health = "unknown"` after a silence window (default: 30s). Never show phantom stale errors after a fix.
 
-### Diagnostics panel
+### Inline diagnostic tooltip (no panel)
 
-Clicking a node with `health = "error" | "warning"` opens the right sidebar with:
-- Full diagnostic messages
-- Source attribution ("from tsc", "from eslint")
-- Line numbers (future: click to jump in the user's editor)
+Hovering a node with `health = "error" | "warning"` extends the standard hover tooltip with:
+- First diagnostic message (one line, truncated if long)
+- If more diagnostics exist: `"+N more — run \`tsc\` for full output"`
+
+No dedicated side panel. Deep detail stays in the user's terminal where `tsc --watch` output already lives. Reference surface shows presence and count, not prose.
 
 ### CC integration
 
@@ -663,30 +662,31 @@ Click-through on any pill opens a detailed status panel. If something is wrong, 
 
 ```
 ┌──────────────────────────────────────────────────────────────┐
-│ Schematic   ● Daemon   ● CC activity   ● Workspace           │ ← top bar
-├──┬─────────────────────────────────────────────────────┬─────┤
-│  │                                                     │     │
-│ L│                                                     │  R  │
-│ e│                                                     │  i  │
-│ f│           WebGL canvas (map)                        │  g  │
-│ t│                                                     │  h  │
-│  │                                                     │  t  │
-│ s│                                                     │     │
-│ i│                                                     │  s  │
-│ d│                                                     │  i  │
-│ e│                                                     │  d  │
-│  │                                                     │  e  │
-├──┴─────────────────────────────────────────────────────┴─────┤
-│ Event feed drawer (toggled with backtick)                    │ ← bottom
-└──────────────────────────────────────────────────────────────┘
+│ Schematic   ● Daemon   ● CC activity   ● Workspace    [↻]   │ ← top bar
+├──┬───────────────────────────────────────────────────────────┤
+│  │                                                           │
+│ L│                                                           │
+│ e│                                                           │
+│ f│                                                           │
+│ t│           WebGL canvas (map)                              │
+│  │                                                           │
+│ s│                                                           │
+│ i│                                                           │
+│ d│                                                           │
+│ e│                                                           │
+│  │                                                           │
+└──┴───────────────────────────────────────────────────────────┘
 ```
 
-- **Left sidebar — Workspaces.** List of all registered workspaces with state indicator, recent activity timestamp, health summary. Right-click → context menu (see §7). Click → switch view to that workspace.
-- **Right sidebar — Diagnostics.** Active when a node or module with issues is focused. Lists errors/warnings grouped by file, with source attribution and line numbers. Future: click to jump in editor.
-- **Event feed — CLI only in v1.** `schematic log --tail` streams events in the user's terminal. No GUI drawer. The drawer was a planned Stage-12 feature; it's deferred. A CLI tail is adequate for debugging and actually plays better with the terminal-based workflow CC lives in.
-- **Top bar** — three status pills (see §10.2), workspace switcher, re-layout button, settings gear.
+- **Top bar** — three status pills (§10.2) and a re-layout button. That's all. No settings gear (settings are CLI-only).
+- **Left sidebar — Workspaces.** List of all registered workspaces with state indicator, recent activity timestamp, health summary. Right-click → context menu (§7). Click a row → switch view. Collapsible. Starts collapsed on first launch.
+- **Canvas** — the map. Occupies 95% of the surface. This is what users are looking at.
+- **Hover tooltip** — ephemeral, near cursor. Shows node name, one metric, and (if the node has errors) the first diagnostic message plus a "run `tsc` for full output" hint.
+- **No right sidebar.** Cut in Round 4. Diagnostics are shown on the map as halos, badges, and in the hover tooltip.
+- **No bottom drawer.** Event feed is CLI (`schematic log --tail`). No GUI.
+- **No settings panel.** CLI (`schematic config get|set`).
 
-All sidebars and the drawer are collapsible and start closed on first launch.
+The canvas is the product. Peripheral UI exists only where it genuinely serves the "is this working?" glance.
 
 ### 10.4 Toast policy
 
@@ -740,7 +740,7 @@ Settings still persist to `~/.schematic/config.json`, just edited via CLI rather
   - Manual overrides locked via `manually_positioned`
   - Collision: force-directed push-apart at rest; live iterative displacement during drag
 - **Health sources:** built-in `tsc --watch` runner (JSON diagnostics), built-in ESLint runner, generic command runner for user-defined tools; parsers: `tsc`, `eslint`, `pytest-json`, `mypy-json`
-- **Mention index:** Aho-Corasick automaton built in memory at workspace activation (~100ms on 20k identifiers). Updated incrementally on node add/remove. Not persisted — rebuild is cheaper than the disk round trip.
+- **No mention index.** Cut in Round 4. CC activity is observed directly from hook tool calls, not inferred from prompt/tool-input scanning.
 - **Persistence:** flat JSON under `~/.schematic/workspaces/<id>/` — node positions, graph cache, event log, health cache, mention index
 - **Hook integration:** shell scripts in the user's **global** Claude Code settings that POST to `localhost:7777/hook` with cwd + session_id-tagged payloads
 - **MCP server:** stdio transport, registered **once globally** in Claude Code settings
@@ -942,3 +942,18 @@ These must remain true no matter how the design evolves:
   Call-graph extraction also split out of Stage 6 into Stage 9b — symbols extracted in first pass, call edges follow if needed. Corresponding design principle saved: **curated smooth, no options.** v1 ships a single opinionated path, not a tree of toggles.
 
 - **2026-04-17** — Terminal-to-map switching surfaced as an open UX concern. `<arch-context>` injection already eliminates the "type the filename" friction (user clicks a node, says "fix it"), but eye-switching remains for single-monitor users. v1 assumes dual-monitor workflow; embedded xterm.js terminal is a v1.5 candidate if dogfood proves the friction real.
+
+- **2026-04-17** — **Product identity crystallized: reference surface, not primary interface.** Schematic is a live reference to what CC is doing architecturally. Users interact with CC through their existing terminal; Schematic is peripheral/glanceable, like a log tail or a health dashboard. §1 updated with this framing and an explicit anti-goal ("not constantly looked at"). Priorities confirmed: glanceability > interactivity.
+
+- **2026-04-17** — **Stage-by-stage audit pass, Rounds 1–4 applied.** David requested a final discipline pass. Applied 14 more cuts across Stages 1–12. Each zero-user-feature-lost, consistent with the reference-surface identity:
+  - **Stage 1:** Drop `rangeLoader.ts` port entirely (no viewport-relative streaming needed); strip crosshair from `interaction.ts` to ~15 lines; surgical extract on `overlayLayer.ts` to ~80 lines (not 259).
+  - **Stage 2:** Hover tooltip stays minimal (filename + one metric), not rich multi-line.
+  - **Stage 4:** Drop `schematic workspaces info <id>` subcommand (redundant with UI).
+  - **Stage 7:** Drop user-sized module bounds override; drop multi-select/lasso/bulk drag entirely.
+  - **Stage 8:** Drop smooth zoom transitions; snap between tiers.
+  - **Stage 9:** Drop symbol search UI; zoom-and-pan is sufficient.
+  - **Stage 10:** Drop Aho-Corasick mention extraction entirely. Extend `ai_intent` with `"reading"` value fired by PreToolUse on Read/Grep/Glob. Single field, no two-sided integration. Arch-context simplified to "selected node + its diagnostics only" (<200 tokens).
+  - **Stage 11:** Drop diagnostics side panel. Inline hover tooltip shows first error + count + "run `tsc` for full output" hint.
+  - **Stage 12:** Drop right sidebar entirely. Drop event drawer. Drop settings panel. Keyboard shortcuts minimized to `Esc`, `+`/`-`, `f` (fit-to-screen). Map is the product; peripheral UI only where it serves the glance.
+  - **Schema cleanup:** removed `last_mention_ts`, `last_mention_source`, `user_multi_selected` from NodeState. Added `"reading"` to `ai_intent` union.
+  - Stages 3, 5, 6 pass untouched — essential plumbing and live-reference spine.

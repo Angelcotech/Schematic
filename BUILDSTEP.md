@@ -262,18 +262,18 @@ Run `pnpm install` again. Verify dev server still boots.
 
 Commit: *"Strip trading deps from frontend package.json"*.
 
-### 1.5 — Port WebGL core files (direct copies)
+### 1.5 — Port WebGL core files
 
 Copy from `~/GateStack-Pro/frontend/src/components/chart/webgl/` to `~/Schematic/frontend/src/webgl/`:
 
 - `viewport.ts` (143 lines) — pure geometry, **copy verbatim**.
 - `renderer.ts` (394 lines) — WebGL 2 harness, **copy verbatim**; note it imports `VERTEX_SHADER`/`FRAGMENT_SHADER` from `shaders.ts` which we will rewrite.
-- `interaction.ts` (83 lines) — crosshair + `pixelToData`, **copy verbatim**.
-- `rangeLoader.ts` (108 lines) — viewport-relative data chunking. **Copy with a TODO**: later adapt bar-width logic to node-density logic.
+- `interaction.ts` (83 lines) — **port surgically**, keep only ~15 lines. The file has crosshair rendering (a trading feature for reading price/time at cursor) plus `pixelToData` coordinate transforms. We need only the transform + mouse-event-to-data-space helpers. Drop crosshair drawing entirely.
+- ~~`rangeLoader.ts`~~ — **do not port.** 108 lines of viewport-relative data streaming logic (loading more bars as the user pans). Schematic keeps the whole graph in memory; no streaming needed.
 
 Run typecheck (`pnpm -w tsc --noEmit`). Expect a few errors where `shaders.ts` no longer exists. Good — that's the seam.
 
-Commit: *"Port WebGL core files from GateStack Pro (verbatim)"*.
+Commit: *"Port WebGL core (viewport, renderer verbatim; interaction surgically stripped)"*.
 
 ### 1.6 — Rewrite `shaders.ts` for nodes + edges
 
@@ -287,16 +287,21 @@ For Stage 1, keep the GLSL minimal — just colored rectangles and straight line
 
 Commit: *"Rewrite shaders for node rectangles and edge lines"*.
 
-### 1.7 — Port `overlayLayer.ts` (adapt)
+### 1.7 — Port `overlayLayer.ts` (surgical extract, ~80 lines)
 
-Copy `overlayLayer.ts` (259 lines) from GateStack-Pro. Edit surgically:
-- Keep: generic drawing primitives (text labels, shapes, lines, boxes).
-- Strip: trading-specific concepts (`levels` as horizontal price lines, `entry lines` as time-range boxes, `indicators` as polylines).
-- Replace with: label-renderer for node names, badge-renderer for error counts, tooltip surface.
+Do NOT copy `overlayLayer.ts` wholesale. Open the GateStack-Pro file (259 lines) and extract only:
+- Generic Canvas 2D drawing primitives (text labels, rounded rectangles, simple shapes)
+- Coordinate-to-pixel mapping helpers
 
-Run typecheck. Fix imports.
+Do NOT port:
+- `levels` as horizontal price lines
+- `entry lines` as time-range boxes
+- `indicators` as polylines
+- Any trading-specific rendering
 
-Commit: *"Port and adapt overlayLayer for node-graph overlays"*.
+Write fresh `overlayLayer.ts` in Schematic with the extracted primitives plus three things for node graphs: label-renderer (node names), badge-renderer (error/warning counts), tooltip-surface. Target: ~80 lines.
+
+Commit: *"Write overlayLayer (labels, badges, tooltip) — extracted primitives from GateStack Pro"*.
 
 ### 1.8 — Port `axes.ts` (decide: adapt or defer)
 
@@ -381,9 +386,9 @@ Wire mouse events on the canvas:
 
 Each event triggers a single re-render pass.
 
-### 2.6 — Simple hover tooltip
+### 2.6 — Minimal hover tooltip
 
-In `overlayLayer.ts`, add a hover tooltip: when a node is hovered, draw a 2D Canvas rectangle near the cursor with the node's `name`, `path`, and `signature` (if symbol).
+In `overlayLayer.ts`, add a hover tooltip rendering a single line near the cursor: node `name` + one metric (line count for files, signature for symbols). Not multi-line, not rich. A reference tool's tooltip is glanced at, not read.
 
 ### 2.7 — Mock state animation
 
@@ -554,9 +559,9 @@ Reverse of install:
 2. Stop daemon.
 3. Prompt user to keep or delete `~/.schematic/` (default: keep, preserves layouts for reinstall).
 
-### 4.5 — `schematic workspaces list | info <id> | forget <id>`
+### 4.5 — `schematic workspaces list | forget <id>`
 
-Simple wrappers over the daemon's HTTP endpoints.
+Simple wrappers over the daemon's HTTP endpoints. `info <id>` dropped — redundant with the browser UI's workspace list.
 
 ### 4.6 — `schematic activate | pause | resume | disable [path]`
 
@@ -813,15 +818,13 @@ When a drag overlaps a non-dragged node, apply a force to displace it outward. U
 
 Compute module bounds from children's bounding box + padding. Recompute on every child move. Render as outer rectangle with label at top-left corner.
 
-### 7.6 — User-sized bounds override
+### 7.6 — (cut) User-sized bounds override
 
-Dragging a module's edge toggles `manually_sized = true`, disables auto-fit. Re-grab-and-drag-interior returns to auto-fit (small UI affordance).
+Deferred to v1.5. Auto-fit is the default; manual resize is a toggle nobody asked for. If auto-fit turns out to be wrong for some cases, revisit.
 
-### 7.7 — Multi-select
+### 7.7 — (cut) Multi-select / lasso / bulk drag
 
-- Shift-drag on empty canvas → lasso rectangle, all nodes inside become `user_multi_selected = true`
-- Ctrl/Cmd-click → toggle individual node membership
-- Any drag on a multi-selected node → bulk drag preserving relative positions
+Deferred to v1.5. Users drag one module at a time; children come along automatically. Multi-select is for non-module groupings, which are rare enough to not justify v1 scope.
 
 ### 7.8 — Full re-layout button
 
@@ -836,7 +839,6 @@ When Stage 6's fs-watcher adds a new node (new file), place it near its nearest 
 - [ ] Drag Engine module → all 30+ children move as one; Prob Engine displaces smoothly
 - [ ] Drop Engine → its position persists across daemon restart
 - [ ] Create a new file in Schematic's own repo → new node appears placed near neighbors, existing positions intact
-- [ ] Lasso-select 5 files → drag one → all 5 move together
 - [ ] Re-layout button wipes manual placements, confirmation modal works
 
 ### Self-hosting check — Stage 7
@@ -884,9 +886,9 @@ At tier 0, module rectangles show:
 - Small red badge with count if `aggregated_health.errors > 0`
 - Dimmer glow if activity was recent but has decayed
 
-### 8.6 — Smooth zoom transitions
+### 8.6 — (cut) Smooth zoom transitions
 
-When the user zooms across a threshold, animate node opacity and edge morphing over ~200ms to avoid flicker.
+Deferred to v1.5. Snapping between tiers is less polished but works. Animation timing and opacity interpolation is pure polish; a peripheral reference tool doesn't need it for v1.
 
 ### Gate criteria — Stage 8
 
@@ -923,15 +925,14 @@ Hover a symbol → tooltip shows `signature`. Click → select, diagnostics side
 
 Extend the hit-test to symbols when at tier 3 zoom.
 
-### 9.4 — Symbol search
+### 9.4 — (cut) Symbol search
 
-Add a search input (floating over the canvas). Typing `extractFeatures` shows autocomplete matching symbols, click → camera zooms to and selects that symbol.
+Deferred to v1.5. Zoom-and-pan is sufficient for the rare case of locating a specific symbol. Users with serious search needs have CC's Grep/Glob. A dedicated search UI can wait.
 
 ### Gate criteria — Stage 9
 
 - [ ] Zoom into `app/src/daemon/extraction/symbols.ts` → individual functions and classes visible as nodes
 - [ ] Hover and click work at symbol granularity
-- [ ] Search for a known symbol name → camera jumps to it
 - [ ] 60fps maintained at tier 3 on Schematic's own codebase
 
 ### Self-hosting check — Stage 9
@@ -999,29 +1000,40 @@ Each tool resolves against the workspace matching the cwd the MCP process was sp
 
 `arch_get_selection`, `arch_find`, `arch_impact` are NOT in v1. Selection is already in `<arch-context>`. Find duplicates Grep/Glob. Impact is `arch_neighbors` walked. Add them only if dogfood proves they'd help.
 
-### 10.3 — arch-context builder
+### 10.3 — arch-context builder (simplified)
 
-`daemon/src/context/builder.ts`: given a workspace, construct the `<arch-context>` block:
+`app/src/daemon/context/builder.ts`: given a workspace, construct a tight `<arch-context>` block:
 - Currently-selected node(s)
-- Recently-mentioned nodes (via Aho-Corasick on the latest prompt)
 - Diagnostics for any focused node (if error/warning)
-- Limit to ~500 tokens — don't flood CC's prompt
+
+That's it. No "recently mentioned" section, no prompt scanning. Selection is the user's explicit focus signal; that's enough for CC to know what "it" refers to when the user says "fix it." Target length: <200 tokens.
 
 ### 10.4 — UserPromptSubmit hook injection
 
 The `UserPromptSubmit` hook script fetches `<arch-context>` from `GET /hook/context?cwd=...` and prepends to the prompt before it reaches CC. If the fetch fails, the prompt passes through unchanged.
 
-### 10.5 — Two-sided mention extraction
+### 10.5 — Extend `ai_intent` with `"reading"` (replaces mention extraction)
 
-In the hook handler, run Aho-Corasick on:
-- `prompt` field (user-side mentions)
-- `target` / tool-input fields (CC-side mentions)
+Aho-Corasick mention extraction cut — over-built for a reference tool. The real signal is "what is CC actually touching," which hooks already provide.
 
-Update `last_mention_ts` on matched nodes.
+Extend the `ai_intent` union with `"reading"`. Fire from:
+- `PreToolUse(Read)` → `ai_intent = "reading"` on the target node
+- `PreToolUse(Grep | Glob)` → same, on any file whose path appears in the tool input
+- Decays to `idle` after ~60 seconds (shorter decay than `modified`)
 
-### 10.6 — Mention glow
+This unifies "CC is looking at X" and "CC is editing X" into one field that the renderer reads. No separate mention index, no two-sided extraction, no Aho-Corasick.
 
-Frontend: subtle yellow-white halo, opacity = `f(now - last_mention_ts)`, fades over ~10 minutes.
+### 10.6 — `ai_intent` visual encoding (absorbs former mention glow)
+
+Extended halo palette:
+- `idle` → no halo
+- `reading` → soft blue halo, low intensity
+- `planning` → yellow halo
+- `modified` → green halo
+- `failed` → orange halo
+- `deleted` → red halo with strikethrough
+
+All driven by the same `ai_intent` field. No separate mention glow.
 
 ### 10.7 — Register MCP in `schematic install`
 
@@ -1078,9 +1090,13 @@ Health rolls up the tree. Module-level aggregate is `{ ok: N, warning: M, error:
 
 Per source, if no diagnostic arrives for >30 seconds after a file change, mark affected nodes `health = "unknown"`.
 
-### 11.9 — Diagnostics side panel
+### 11.9 — Inline diagnostic hover tooltip (no side panel)
 
-Right sidebar in frontend: when a node with errors is selected, shows full diagnostic messages with source attribution.
+Side panel cut. Instead, when hovering a node with `health = "error" | "warning"`, the existing tooltip (from Stage 1.7) extends to include:
+- First diagnostic message (one line, truncated if long)
+- If more than one diagnostic: `"+N more — run \`tsc\` for full output"`
+
+Deep detail stays in the user's terminal, where `tsc --watch` output already lives. Reference surface shows presence and count, not prose.
 
 ### 11.10 — `arch_health` MCP tool
 
@@ -1125,9 +1141,9 @@ Implement daemon / CC activity / workspace pills with hover tooltips per BUILDIN
 
 List view with state indicator, recent activity timestamp, health summary. Click → switch view. Right-click → context menu (activate/pause/resume/disable/re-index/forget).
 
-### 12.3 — Right sidebar: diagnostics
+### 12.3 — (cut) Right sidebar
 
-Already partially built in Stage 11; polish formatting, grouping, keyboard nav.
+Removed in Round 4 efficiency pass. Diagnostics are shown as node halos, badges, and inline hover tooltips. No persistent right-side panel surface; screen space goes to the map.
 
 ### 12.4 — Event feed: CLI only in v1
 
@@ -1151,14 +1167,13 @@ No cadence setting. No policy panel. One behavior, tuned sensibly. See BUILDING_
 
 **No GUI panel.** `schematic config get <key>` / `set <key> <value>`. Opinionated defaults work out of the box; advanced users run a CLI command. Panel is v1.5.
 
-### 12.8 — Keyboard navigation
+### 12.8 — Minimal keyboard shortcuts
 
-- `/` → focus search
-- `` ` `` → toggle event drawer
-- `Esc` → clear selection / close modals
-- Arrow keys → pan
-- `+` / `-` → zoom
-- `[` / `]` → cycle workspaces
+- `Esc` → clear selection / close welcome overlay
+- `+` / `-` → zoom in / out
+- `f` → fit-to-screen (frame all nodes in viewport)
+
+Everything else (search, drawer toggle, arrow-key panning, workspace cycling) is cut. Mouse covers the rest. Power-user keyboard navigation is v1.5.
 
 ### 12.9 — Decay tuning
 
@@ -1184,31 +1199,39 @@ Use Schematic as your only entry point to navigate Schematic's own codebase for 
 
 ---
 
-## Stage 13 — Distribution (optional)
+## Stage 13 — Minimum shippable packaging
 
-**Goal:** Package Schematic for distribution to other developers.
+**Goal:** Schematic is a valid installable npm package with enough metadata to work. Nothing more.
 
 **Dependencies:** Stage 12.
 
-### 13.1 — Chrome extension wrapper
+**Estimated effort:** Half a day.
 
-Publishes `localhost:7777` as an always-on-top popup. Uses `chrome.windows.create({type:'popup', alwaysOnTop:true})`.
+### 13.1 — Valid `package.json`
 
-### 13.2 — LaunchAgent auto-start
+- `name`, `version`, `description`
+- `bin: { "schematic": "dist/cli/index.js" }`
+- `files` allowlist (so `npm pack` excludes dev stuff)
+- Correct `engines` constraint (Node version)
+- Correct `dependencies` / `devDependencies` split
 
-macOS `~/Library/LaunchAgents/com.schematic.daemon.plist` spawns the daemon on login. Wrap in `schematic autostart enable | disable`.
+### 13.2 — Minimal README installation note
 
-### 13.3 — Installer polish
-
-Published as a proper npm package with versioning, changelog, postinstall hints.
-
-### 13.4 — Docs
-
-A proper README, quickstart, FAQ. Website? Only if distributing broadly.
+One short section in the existing README: "Install with `npm install -g schematic && schematic install`. Open `localhost:7777`." Point to `USER_SIMULATION.md` for the full walkthrough.
 
 ### Gate criteria — Stage 13
 
-- [ ] Someone other than David can install Schematic in <5 minutes and see their own repo visualized
+- [ ] `npm pack` produces a clean tarball
+- [ ] Installing from the tarball on a fresh machine works end-to-end
+
+### Cut from Stage 13 (v1.5 candidates)
+
+- **Chrome extension always-on-top popup** — for single-monitor tab-burial. Revisit if dogfooding proves it real.
+- **LaunchAgent auto-start** — login-boot daemon. `schematic start` is fine.
+- **Changelog, postinstall hints, rich messaging** — npm hygiene only in v1.
+- **External documentation site, quickstart, FAQ** — the four repo docs are the docs. No marketing surface.
+
+Distribution beyond David's own use is a v1.5+ concern with its own purpose-built stage.
 
 ---
 
@@ -1244,22 +1267,62 @@ A real v1 UX concern: users type in a CC terminal, watch Schematic in a browser 
 
 **v1 stance:** assume dual-monitor workflow. Keep `<arch-context>` rich so typing is minimized. Ship. If dogfood proves the terminal switch costs real attention, pull xterm.js into v1.5 as priority-one.
 
-### What was cut (2026-04-17 efficiency pass)
+### What was cut
 
-Applied 8 simplifications before writing any code. Each cut zero user-visible features:
+Applied in two passes on 2026-04-17 — an initial efficiency pass, then a stage-by-stage audit against the reference-surface identity. Each cut lost zero user-visible features.
 
-1. **4 workspaces → 2** (`app` + `frontend`; shared types via folder not package)
-2. **Event-emitter abstraction → direct mutation + broadcast**
-3. **Aho-Corasick index serialization → in-memory only**
-4. **3 health-runner classes → 1 runner + named parsers**
-5. **5 workspace states → 3** (`active`, `paused`, `disabled`)
-6. **5 MCP tools → 2** (`arch_neighbors`, `arch_health`)
-7. **GUI settings panel → CLI only**
-8. **GUI event drawer → CLI only** (`schematic log --tail`)
+**Structural cuts (efficiency pass):**
+1. 4 workspaces → 2 (`app` + `frontend`; shared types as folder)
+2. Event-emitter abstraction → direct mutation + broadcast
+3. Aho-Corasick index serialization → in-memory only (later cut entirely)
+4. 3 health-runner classes → 1 runner + named parsers
+5. 5 workspace states → 3 (`active`, `paused`, `disabled`)
+6. 5 MCP tools → 2 (`arch_neighbors`, `arch_health`)
+7. GUI settings panel → CLI only
+8. GUI event drawer → CLI only (`schematic log --tail`)
+9. Call-graph extraction split from Stage 6 into Stage 9b
 
-Additionally, **call-graph extraction split out of Stage 6 into Stage 9b** — symbols first-class, call edges later if needed.
+**Stage-by-stage audit cuts:**
 
-Design principle adopted: **curated smooth, no options.** Single opinionated path, not a tree of toggles. Users don't miss features that don't exist.
+*Stage 1:*
+10. `rangeLoader.ts` port dropped entirely
+11. Crosshair code stripped from `interaction.ts` (~15 lines instead of 83)
+12. `overlayLayer.ts` surgical extract (~80 lines instead of 259)
+
+*Stage 4:*
+13. `schematic workspaces info <id>` subcommand dropped
+
+*Stage 7:*
+14. User-sized module bounds override dropped
+15. Multi-select / lasso / bulk drag dropped
+
+*Stage 8:*
+16. Smooth zoom-transition animations dropped (snap between tiers)
+
+*Stage 9:*
+17. Symbol search UI dropped
+
+*Stage 10:*
+18. Aho-Corasick mention extraction dropped entirely. Replaced by extending `ai_intent` with a `"reading"` value fired by PreToolUse on Read/Grep/Glob.
+19. `<arch-context>` simplified to "selected node + diagnostics" (<200 tokens, no recent-mentions)
+
+*Stage 11:*
+20. Diagnostics side panel dropped. Inline hover tooltip shows first error + "run `tsc` for more."
+
+*Stage 12:*
+21. Right sidebar dropped entirely
+22. Keyboard shortcuts minimized to `Esc`, `+`/`-`, `f`
+
+*Stage 13:*
+23. Chrome extension wrapper → v1.5
+24. LaunchAgent auto-start → v1.5
+25. External docs / website / FAQ → not in v1
+26. Changelog / postinstall polish → v1.5
+
+*Schema cleanup:*
+27. `last_mention_ts`, `last_mention_source`, `user_multi_selected` removed from `NodeState`
+
+Design principles adopted: **curated smooth, no options.** **Reference surface, not primary interface.** Single opinionated path. Glanceability > interactivity. Users don't miss features that don't exist.
 
 ## Global reminders
 
