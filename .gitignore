@@ -4,3 +4,9 @@ dist/
 .schematic/
 .DS_Store
 *.log
+
+# Build-time copies of root files into app/ (made by scripts/copy-frontend.mjs
+# so npm pack can ship them). Source-of-truth is at the repo root.
+app/LICENSE
+app/README.md
+*.tgz

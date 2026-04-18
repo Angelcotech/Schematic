@@ -1,11 +1,24 @@
-// Stage 5: live pipeline. CC hook → daemon → WebSocket → this page. The
-// GraphStore mirrors the daemon's per-workspace NodeState; the render loop
-// reads from it. Stage 2's mock graph is still around in mock-graph.ts as a
-// reference but is no longer loaded here.
+// Canvas-era frontend entry point. Replaces the old directory-render path.
+// Data flow: fetch focused workspace → fetch its canvases → pick the active
+// canvas → render its nodes+edges + overlay live file activity.
+//
+// Key architectural shift from pre-Stage-17 Schematic:
+//   - There is no "graph" shared across the workspace — each canvas is a
+//     standalone authored diagram.
+//   - A file can appear as N CanvasNode instances; activity fans out to all
+//     of them via the fileActivity map keyed by file_path.
+//   - CC (via MCP tools) is the primary author. Users drag and rename.
 
-import type { Edge } from "@shared/edge.js";
-import type { NodeState } from "@shared/node-state.js";
 import type { Workspace } from "@shared/workspace.js";
+import type { Canvas, CanvasEdge, CanvasNode } from "@shared/canvas.js";
+import type { FileActivity } from "@shared/file-activity.js";
+import type {
+  AiIntent,
+  Health,
+  NodeKind,
+  NodeState,
+} from "@shared/node-state.js";
+import type { Edge } from "@shared/edge.js";
 import { initGL, resizeCanvas, render } from "./webgl/renderer.js";
 import {
   clearOverlay,
@@ -27,19 +40,15 @@ import {
   nodeDraws,
   type NodeBuffers,
 } from "./graph/node-renderer.js";
-import {
-  buildEdgeBuffer,
-  destroyEdgeBuffer,
-  edgeDraw,
-  type EdgeBuffer,
-} from "./graph/edge-renderer.js";
+import { drawEdges2D, hitTestEdge } from "./graph/edge-renderer-2d.js";
+import { drawProcessGroups } from "./graph/process-renderer.js";
 import { hitTest } from "./graph/hit-test.js";
-import { aggregateActivity } from "./graph/aggregation.js";
-import { GraphStore } from "./state/graph-store.js";
 import { DaemonWSClient, type ConnectionState } from "./state/ws-client.js";
 
-const DAEMON_ORIGIN = `http://${window.location.hostname}:7777`;
-const DAEMON_WS = `ws://${window.location.hostname}:7777/ws`;
+// Same-origin when served by daemon; Vite dev proxies.
+const DAEMON_ORIGIN = "";
+const wsProto = window.location.protocol === "https:" ? "wss:" : "ws:";
+const DAEMON_WS = `${wsProto}//${window.location.host}/ws`;
 
 function requireEl<T extends HTMLElement>(id: string): T {
   const el = document.getElementById(id);
@@ -50,183 +59,386 @@ function requireEl<T extends HTMLElement>(id: string): T {
 const canvas = requireEl<HTMLCanvasElement>("canvas");
 const container = canvas.parentElement;
 if (!container) throw new Error("[schematic] canvas has no parent");
+const tabbarEl = requireEl<HTMLDivElement>("tabbar");
+const emptyStateEl = requireEl<HTMLDivElement>("empty-state");
 
 const ctx = initGL(canvas);
 const overlay = createOverlay(container);
 
-const store = new GraphStore();
-let edges: Edge[] = [];
+// ---------------------------------------------------------------------------
+// State
+// ---------------------------------------------------------------------------
 
-let nodeBuffers: NodeBuffers = buildNodeBuffers(ctx, []);
-let edgeBuffer: EdgeBuffer | null = null;
+interface AppState {
+  workspaces: Workspace[];
+  activeWorkspaceId: string | null;
 
-// --- Zoom-tier LOD ---
-// Tier 0: only modules visible. File → file edges collapse into
-//         module → module aggregated edges with thickness = count.
-// Tier 1: modules + files with raw file-level edges.
-// Symbols are NOT rendered on the map — they appear in a side panel
-// when a file is clicked. Keeps the map readable at every zoom.
-const MIN_FILE_PIXELS = 55;
+  canvases: Canvas[];
+  activeCanvasId: string | null;
 
-function computeTier(): 0 | 1 {
-  const allNodes = store.all();
-  const files = allNodes.filter((n) => n.kind === "file");
-  if (files.length === 0) return 1;
-  const visibleDataWidth = viewport.xMax - viewport.xMin;
-  if (visibleDataWidth <= 0) return 1;
-  const minFileW = Math.min(...files.map((f) => f.width));
-  const screenW = (minFileW / visibleDataWidth) * canvas.clientWidth;
-  return screenW < MIN_FILE_PIXELS ? 0 : 1;
+  nodes: CanvasNode[];
+  edges: CanvasEdge[];
+
+  fileActivity: Map<string, FileActivity>;
+
+  // Selection is a set so shift-click can accumulate. The node renderer's
+  // `user_state: "selected"` is still a boolean per node, so we surface
+  // "is this node in the set" in the toRenderNode adapter.
+  selectedNodeIds: Set<string>;
+  hoveredNodeId: string | null;
+  hoveredEdgeId: string | null;
+
+  connection: ConnectionState;
 }
 
-function aggregateEdgesByModule(rawEdges: Edge[], nodes: NodeState[]): Edge[] {
-  const parentOf = new Map<string, string>();
-  for (const n of nodes) if (n.parent) parentOf.set(n.id, n.parent);
-  const counts = new Map<string, number>();
-  for (const e of rawEdges) {
-    const srcMod = parentOf.get(e.source);
-    const dstMod = parentOf.get(e.target);
-    if (!srcMod || !dstMod) continue;
-    if (srcMod === dstMod) continue; // intra-module edges don't cross boundaries
-    const key = `${srcMod}|${dstMod}`;
-    counts.set(key, (counts.get(key) ?? 0) + 1);
-  }
-  const out: Edge[] = [];
-  for (const [key, count] of counts) {
-    const sep = key.indexOf("|");
-    out.push({
-      source: key.slice(0, sep),
-      target: key.slice(sep + 1),
-      kind: "import",
-      highlighted: false,
-      weight: count,
-    });
-  }
-  return out;
-}
+const app: AppState = {
+  workspaces: [],
+  activeWorkspaceId: null,
+  canvases: [],
+  activeCanvasId: null,
+  nodes: [],
+  edges: [],
+  fileActivity: new Map(),
+  selectedNodeIds: new Set(),
+  hoveredNodeId: null,
+  hoveredEdgeId: null,
+  connection: "closed",
+};
 
-let currentTier: 0 | 1 = 1;
-
-function rebuildBuffers(): void {
-  destroyNodeBuffers(ctx, nodeBuffers);
-  destroyEdgeBuffer(ctx, edgeBuffer);
-  const allNodes = store.all();
-
-  // Roll up leaf state into module aggregates so the renderer can glow
-  // modules whose children are active.
-  aggregateActivity(allNodes);
-
-  const tier = computeTier();
-  currentTier = tier;
-
-  const visibleNodes =
-    tier === 0 ? allNodes.filter((n) => n.kind === "module") :
-    allNodes.filter((n) => n.kind !== "symbol");
-  nodeBuffers = buildNodeBuffers(ctx, visibleNodes);
-
-  const visibleNodeIds = new Set(visibleNodes.map((n) => n.id));
-  const edgesToShow = tier === 0
-    ? aggregateEdgesByModule(edges, allNodes)
-    : edges.filter((e) => visibleNodeIds.has(e.source) && visibleNodeIds.has(e.target));
-  edgeBuffer = buildEdgeBuffer(ctx, visibleNodes, edgesToShow);
-}
-
-// Track whether the tier has crossed a threshold since the last frame so
-// we can trigger a cheap buffer rebuild only when needed (zoom in/out is
-// the common case that changes which buffer set is right).
-function maybeRebuildForTier(): void {
-  const tier = computeTier();
-  if (tier !== currentTier) {
-    rebuildBuffers();
-  }
-}
-
-// --- Viewport ---
 let viewport: ViewportState = {
   xMin: -10, xMax: 10, yMin: -10, yMax: 10,
   width: canvas.clientWidth, height: canvas.clientHeight,
 };
 
-function fitToCurrentNodes(): void {
-  const nodes = store.all();
-  if (nodes.length === 0) return;
+let nodeBuffers: NodeBuffers = buildNodeBuffers(ctx, []);
+
+let cursorPx = -1;
+let cursorPy = -1;
+
+// ---------------------------------------------------------------------------
+// Render-adapter: CanvasNode + FileActivity → NodeState shape the node
+// renderer already knows how to paint. Kept tight so the one-file-many-nodes
+// model stays honest: visuals come entirely from the canvas node and the
+// file's current activity — nothing else.
+// ---------------------------------------------------------------------------
+
+function languageForPath(filePath: string): string | undefined {
+  const ext = filePath.slice(filePath.lastIndexOf(".")).toLowerCase();
+  switch (ext) {
+    case ".ts": return "ts";
+    case ".tsx": return "tsx";
+    case ".js": case ".mjs": case ".cjs": return "js";
+    case ".jsx": return "jsx";
+    case ".py": return "py";
+    case ".rs": return "rs";
+    case ".go": return "go";
+    case ".md": return "md";
+    case ".json": return "json";
+    default: return undefined;
+  }
+}
+
+function toRenderNode(cn: CanvasNode): NodeState {
+  const activity = app.fileActivity.get(cn.file_path);
+  const name = cn.file_path.slice(cn.file_path.lastIndexOf("/") + 1);
+  const kind: NodeKind = "file";
+  const lang = languageForPath(cn.file_path);
+  const ai_intent: AiIntent = activity?.ai_intent ?? "idle";
+  const health: Health = activity?.health ?? "unknown";
+
+  const node: NodeState = {
+    id: cn.id,
+    path: cn.file_path,
+    name,
+    kind,
+    depth: 0,
+    exports: [],
+    imports: [],
+    line_count: 0,
+    byte_size: 0,
+    x: cn.x,
+    y: cn.y,
+    width: cn.width,
+    height: cn.height,
+    manually_positioned: true,
+    manually_sized: true,
+    layout_locked: false,
+    ai_intent,
+    user_state: app.selectedNodeIds.has(cn.id) ? "selected" : "none",
+    in_arch_context: false,
+    aggregated_ai_intent: "idle",
+    aggregated_activity_count: 0,
+    aggregated_activity_ts: 0,
+    aggregated_health: { ok: 0, warning: 0, error: 0 },
+    health,
+  };
+  if (lang !== undefined) node.language = lang;
+  if (activity?.ai_intent_since !== undefined) node.ai_intent_since = activity.ai_intent_since;
+  if (activity?.ai_intent_tool !== undefined) node.ai_intent_tool = activity.ai_intent_tool;
+  if (activity?.health_detail !== undefined) node.health_detail = activity.health_detail;
+  if (activity?.health_source !== undefined) node.health_source = activity.health_source;
+  return node;
+}
+
+// Edge adapter: drawEdges2D expects {source, target} as node ids; CanvasEdge
+// uses {src, dst}. Trivial shim, kept here to avoid leaking vocabulary.
+function toRenderEdge(ce: CanvasEdge): Edge {
+  const edge: Edge = {
+    source: ce.src,
+    target: ce.dst,
+    kind: (ce.kind ?? "custom") === "imports" ? "import"
+        : ce.kind === "calls" ? "calls"
+        : ce.kind === "reads" ? "type_only"   // reuse gray palette entry
+        : ce.kind === "writes" ? "dynamic_import"
+        : ce.kind === "control" ? "side_effect"
+        : "import",
+    highlighted: false,
+  };
+  if (ce.label !== undefined) edge.label = ce.label;
+  return edge;
+}
+
+// ---------------------------------------------------------------------------
+// Render loop
+// ---------------------------------------------------------------------------
+
+let frameQueued = false;
+function requestFrame(): void {
+  if (frameQueued) return;
+  frameQueued = true;
+  requestAnimationFrame(() => {
+    frameQueued = false;
+    renderAll();
+  });
+}
+
+function renderAll(): void {
+  const renderNodes = app.nodes.map(toRenderNode);
+  const renderEdges = app.edges.map(toRenderEdge);
+
+  destroyNodeBuffers(ctx, nodeBuffers);
+  nodeBuffers = buildNodeBuffers(ctx, renderNodes);
+  render(ctx, viewport, nodeDraws(ctx, nodeBuffers));
+
+  clearOverlay(overlay);
+  const c2d = overlay.ctx;
+
+  // Process groups first — they're a subtle backdrop; edges and nodes
+  // paint over them cleanly.
+  drawProcessGroups(c2d, viewport, app.nodes);
+
+  // Edges next so labels and halos paint on top.
+  drawEdges2D(c2d, viewport, renderEdges, renderNodes);
+
+  drawStatusLine(c2d);
+  drawNodeLabels(c2d);
+
+  if (app.hoveredNodeId !== null) drawHoverTooltip(c2d);
+  else if (app.hoveredEdgeId !== null) drawEdgeHoverTooltip(c2d);
+
+  // Empty state is managed via the DOM overlay (#empty-state), which is
+  // shown/hidden by updateEmptyState(). No draw here.
+}
+
+function drawStatusLine(c2d: CanvasRenderingContext2D): void {
+  c2d.font = "11px -apple-system, BlinkMacSystemFont, sans-serif";
+  c2d.fillStyle = "rgba(200, 200, 200, 0.6)";
+  c2d.textAlign = "left";
+  c2d.textBaseline = "top";
+  const ws = app.workspaces.find((w) => w.id === app.activeWorkspaceId);
+  const cvs = app.canvases.find((c) => c.id === app.activeCanvasId);
+  const parts: string[] = [
+    `${app.connection === "open" ? "●" : "○"} daemon`,
+    `workspace: ${ws?.name ?? "(none)"}`,
+    `canvas: ${cvs?.name ?? "(none)"}`,
+    `${app.nodes.length} nodes`,
+  ];
+  c2d.fillText(parts.join("  —  "), 8, 8);
+}
+
+function drawNodeLabels(c2d: CanvasRenderingContext2D): void {
+  c2d.textAlign = "center";
+  c2d.textBaseline = "middle";
+  for (const cn of app.nodes) {
+    const tl = dataToPixel(viewport, cn.x, cn.y + cn.height);
+    const br = dataToPixel(viewport, cn.x + cn.width, cn.y);
+    const wPx = br.px - tl.px;
+    const hPx = br.py - tl.py;
+    if (hPx < 10) continue; // too small to read
+    const fontSize = Math.min(Math.max(hPx * 0.38, 10), 22);
+    c2d.font = `${fontSize}px -apple-system, BlinkMacSystemFont, sans-serif`;
+    c2d.fillStyle = "rgba(240, 240, 240, 0.95)";
+    const name = cn.file_path.slice(cn.file_path.lastIndexOf("/") + 1);
+    const label = truncateToWidth(c2d, name, wPx - 12);
+    c2d.fillText(label, (tl.px + br.px) / 2, (tl.py + br.py) / 2);
+  }
+}
+
+function truncateToWidth(c2d: CanvasRenderingContext2D, text: string, maxW: number): string {
+  if (c2d.measureText(text).width <= maxW) return text;
+  const ellipsis = "…";
+  let lo = 0, hi = text.length;
+  while (lo < hi) {
+    const mid = (lo + hi + 1) >> 1;
+    const w = c2d.measureText(text.slice(0, mid) + ellipsis).width;
+    if (w <= maxW) lo = mid;
+    else hi = mid - 1;
+  }
+  return lo === 0 ? "" : text.slice(0, lo) + ellipsis;
+}
+
+function drawHoverTooltip(_c2d: CanvasRenderingContext2D): void {
+  const cn = app.nodes.find((n) => n.id === app.hoveredNodeId);
+  if (!cn) return;
+  const activity = app.fileActivity.get(cn.file_path);
+  const lines: string[] = [cn.file_path];
+  if (cn.process) lines.push(`process: ${cn.process}`);
+  if (activity && activity.health !== "unknown" && activity.health !== "ok") {
+    const label = activity.health === "error" ? "✗" : "⚠";
+    const src = activity.health_source ? ` (${activity.health_source})` : "";
+    lines.push(`${label} ${activity.health_detail ?? activity.health}${src}`);
+  }
+  drawTooltip(overlay, cursorPx, cursorPy, lines);
+}
+
+function drawEdgeHoverTooltip(_c2d: CanvasRenderingContext2D): void {
+  const ce = app.edges.find((e) => e.id === app.hoveredEdgeId);
+  if (!ce) return;
+  const srcNode = app.nodes.find((n) => n.id === ce.src);
+  const dstNode = app.nodes.find((n) => n.id === ce.dst);
+  if (!srcNode || !dstNode) return;
+  const srcName = srcNode.file_path.slice(srcNode.file_path.lastIndexOf("/") + 1);
+  const dstName = dstNode.file_path.slice(dstNode.file_path.lastIndexOf("/") + 1);
+  const lines: string[] = [];
+  if (ce.label) lines.push(ce.label);
+  lines.push(`${srcName} → ${dstName}`);
+  if (ce.kind) lines.push(`kind: ${ce.kind}`);
+  drawTooltip(overlay, cursorPx, cursorPy, lines);
+}
+
+// ---------------------------------------------------------------------------
+// Tab bar (DOM-managed, not canvas-2D — click handling is free this way)
+// ---------------------------------------------------------------------------
+
+function renderTabs(): void {
+  tabbarEl.innerHTML = "";
+  for (const cv of app.canvases) {
+    const chip = document.createElement("div");
+    chip.className = "tab" + (cv.id === app.activeCanvasId ? " active" : "");
+    chip.textContent = cv.name;
+    chip.title = cv.description ?? "";
+    chip.addEventListener("click", () => {
+      if (cv.id === app.activeCanvasId) return;
+      void switchCanvas(cv.id);
+    });
+    tabbarEl.appendChild(chip);
+  }
+  const add = document.createElement("div");
+  add.className = "new-canvas";
+  add.textContent = "+ new";
+  add.title = "Create a new canvas";
+  add.addEventListener("click", () => {
+    void createCanvasPrompt();
+  });
+  tabbarEl.appendChild(add);
+}
+
+function updateEmptyState(): void {
+  emptyStateEl.style.display =
+    app.activeWorkspaceId && app.canvases.length === 0 ? "flex" : "none";
+}
+
+async function createCanvasPrompt(): Promise<void> {
+  if (!app.activeWorkspaceId) return;
+  const name = window.prompt("Canvas name?");
+  if (!name) return;
+  const r = await fetch(
+    `${DAEMON_ORIGIN}/workspaces/${app.activeWorkspaceId}/canvases`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name }),
+    },
+  );
+  if (!r.ok) {
+    console.error("[schematic] create canvas failed:", r.status);
+    return;
+  }
+  // canvas.created event will refresh the tab bar; we'll switch to it too.
+  const file = (await r.json()) as { canvas: Canvas };
+  await switchCanvas(file.canvas.id);
+}
+
+// ---------------------------------------------------------------------------
+// Data loading
+// ---------------------------------------------------------------------------
+
+async function fetchJSON<T>(path: string): Promise<T> {
+  const r = await fetch(`${DAEMON_ORIGIN}${path}`);
+  if (!r.ok) throw new Error(`[schematic] ${path} failed: ${r.status}`);
+  return r.json() as Promise<T>;
+}
+
+async function reloadWorkspaceScope(workspaceId: string | null): Promise<void> {
+  app.activeWorkspaceId = workspaceId;
+  app.canvases = [];
+  app.activeCanvasId = null;
+  app.nodes = [];
+  app.edges = [];
+  app.fileActivity.clear();
+  app.selectedNodeIds.clear();
+
+  if (workspaceId) {
+    app.canvases = await fetchJSON<Canvas[]>(`/workspaces/${workspaceId}/canvases`);
+    const initial = app.canvases[0];
+    if (initial) {
+      await switchCanvas(initial.id);
+    } else {
+      renderTabs();
+      updateEmptyState();
+      requestFrame();
+    }
+  } else {
+    renderTabs();
+    updateEmptyState();
+    requestFrame();
+  }
+}
+
+async function switchCanvas(canvasId: string): Promise<void> {
+  if (!app.activeWorkspaceId) return;
+  const file = await fetchJSON<{ canvas: Canvas; nodes: CanvasNode[]; edges: CanvasEdge[] }>(
+    `/workspaces/${app.activeWorkspaceId}/canvases/${canvasId}`,
+  );
+  app.activeCanvasId = canvasId;
+  app.nodes = file.nodes;
+  app.edges = file.edges;
+  app.selectedNodeIds.clear();
+  fitToNodes();
+  renderTabs();
+  updateEmptyState();
+  requestFrame();
+}
+
+function fitToNodes(): void {
+  if (app.nodes.length === 0) {
+    viewport = { ...viewport, xMin: -10, xMax: 10, yMin: -10, yMax: 10 };
+    return;
+  }
   let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
-  for (const n of nodes) {
+  for (const n of app.nodes) {
     if (n.x < minX) minX = n.x;
     if (n.y < minY) minY = n.y;
     if (n.x + n.width > maxX) maxX = n.x + n.width;
     if (n.y + n.height > maxY) maxY = n.y + n.height;
   }
-  viewport = fitToBounds(viewport, minX, maxX, minY, maxY, 0.1);
+  viewport = fitToBounds(viewport, minX, maxX, minY, maxY, 0.15);
 }
 
-// --- Hover & selection ---
-let hoveredNodeId: string | null = null;
-let cursorPx = -1;
-let cursorPy = -1;
+// ---------------------------------------------------------------------------
+// Interaction
+// ---------------------------------------------------------------------------
 
-function setHover(nodeId: string | null): void {
-  if (nodeId === hoveredNodeId) return;
-  hoveredNodeId = nodeId;
-  canvas.style.cursor = nodeId ? "pointer" : "default";
-  requestFrame();
-}
-
-function setSelection(nodeId: string | null): void {
-  let changed = false;
-  for (const n of store.all()) {
-    const shouldBeSelected = n.id === nodeId;
-    if (shouldBeSelected && n.user_state !== "selected") {
-      n.user_state = "selected";
-      changed = true;
-    } else if (!shouldBeSelected && n.user_state === "selected") {
-      n.user_state = "none";
-      changed = true;
-    }
-  }
-  if (changed) {
-    rebuildBuffers();
-    requestFrame();
-    // Mirror the selection to the daemon so arch-context reflects it on
-    // the next UserPromptSubmit. Fire-and-forget — any network error
-    // just means CC will receive an older selection, never a crash.
-    void syncSelection(nodeId);
-  }
-}
-
-async function syncSelection(nodeId: string | null): Promise<void> {
-  if (!app.activeWorkspaceId) return;
-  try {
-    await fetch(`${DAEMON_ORIGIN}/workspaces/${app.activeWorkspaceId}/selection`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ node_id: nodeId }),
-    });
-  } catch {
-    // Schematic is peripheral — don't bubble transport failures.
-  }
-}
-
-// --- Workspace + connection state (rendered in the status line) ---
-interface ExtractionProgress {
-  phase: string;
-  processed: number;
-  total: number;
-}
-interface AppState {
-  workspaces: Workspace[];
-  activeWorkspaceId: string | null;
-  connection: ConnectionState;
-  progress: ExtractionProgress | null;
-}
-const app: AppState = {
-  workspaces: [],
-  activeWorkspaceId: null,
-  connection: "closed",
-  progress: null,
-};
-
-// --- Event wiring ---
 function resize(): void {
   viewport.width = canvas.clientWidth;
   viewport.height = canvas.clientHeight;
@@ -236,77 +448,60 @@ function resize(): void {
 }
 window.addEventListener("resize", resize);
 
-// --- Drag state: one of "viewport" (pan), "node" (module drag), or null.
-type DragMode = null | { kind: "viewport" } | {
-  kind: "node";
-  rootId: string;
-  subtreeIds: string[];
-  startPositions: Map<string, { x: number; y: number }>;
-  startDataX: number; // cursor in data space at drag start
-  startDataY: number;
-  movedIds: Set<string>; // everything touched this drag (includes push-apart)
-};
+type DragMode =
+  | null
+  | { kind: "viewport" }
+  | {
+      kind: "node";
+      // All nodes moving together this drag; always includes the primary
+      // (clicked) node first. startPositions captures their pre-drag x/y
+      // so relative spacing is preserved as the group translates.
+      nodeIds: string[];
+      startPositions: Map<string, { x: number; y: number }>;
+      startDataX: number; // cursor data coords at drag start
+      startDataY: number;
+    };
 
 let drag: DragMode = null;
 let dragStartScreenX = 0, dragStartScreenY = 0;
 let didDrag = false;
 let lastX = 0, lastY = 0;
 
-function subtreeOf(rootId: string): string[] {
-  const root = store.get(rootId);
-  if (!root) return [rootId];
-  if (!root.children) return [rootId];
-  return [rootId, ...root.children];
-}
-
-function hitTestVisible(px: number, py: number): NodeState | null {
-  const nodes = currentTier === 0
-    ? store.all().filter((n) => n.kind === "module")
-    : store.all().filter((n) => n.kind !== "symbol");
-  return hitTest(viewport, nodes, px, py);
+function hitTestVisible(px: number, py: number): CanvasNode | null {
+  const renderNodes = app.nodes.map(toRenderNode);
+  const hit = hitTest(viewport, renderNodes, px, py);
+  if (!hit) return null;
+  return app.nodes.find((n) => n.id === hit.id) ?? null;
 }
 
 canvas.addEventListener("mousedown", (e) => {
+  if (e.button !== 0) return;
+  const rect = canvas.getBoundingClientRect();
+  const px = e.clientX - rect.left;
+  const py = e.clientY - rect.top;
   didDrag = false;
   dragStartScreenX = e.clientX;
   dragStartScreenY = e.clientY;
   lastX = e.clientX;
   lastY = e.clientY;
-
-  const rect = canvas.getBoundingClientRect();
-  const px = e.clientX - rect.left;
-  const py = e.clientY - rect.top;
   const hit = hitTestVisible(px, py);
-
-  // Only modules are draggable in v1. Files/symbols still select on click.
-  if (hit && hit.kind === "module") {
-    const subtreeIds = subtreeOf(hit.id);
+  if (hit) {
+    // If the clicked node is already selected and we have a multi-selection,
+    // drag ALL selected nodes together. Otherwise drag only the clicked one.
+    const useGroup = app.selectedNodeIds.has(hit.id) && app.selectedNodeIds.size > 1;
+    const nodeIds = useGroup ? Array.from(app.selectedNodeIds) : [hit.id];
     const startPositions = new Map<string, { x: number; y: number }>();
-    for (const id of subtreeIds) {
-      const n = store.get(id);
+    for (const id of nodeIds) {
+      const n = app.nodes.find((nn) => nn.id === id);
       if (n) startPositions.set(id, { x: n.x, y: n.y });
-    }
-    // Also snapshot other modules + their children in case push-apart moves them.
-    for (const n of store.all()) {
-      if (n.kind === "module" && n.id !== hit.id) {
-        startPositions.set(n.id, { x: n.x, y: n.y });
-        if (n.children) {
-          for (const childId of n.children) {
-            const child = store.get(childId);
-            if (child) startPositions.set(childId, { x: child.x, y: child.y });
-          }
-        }
-      }
     }
     const { x: dx0, y: dy0 } = pixelToData(viewport, px, py);
     drag = {
       kind: "node",
-      rootId: hit.id,
-      subtreeIds,
+      nodeIds,
       startPositions,
       startDataX: dx0,
       startDataY: dy0,
-      movedIds: new Set(subtreeIds),
     };
     canvas.style.cursor = "grabbing";
   } else {
@@ -319,25 +514,32 @@ window.addEventListener("mouseup", (e) => {
   const wasNodeDrag = drag.kind === "node" ? drag : null;
   drag = null;
   canvas.style.cursor = "default";
-
   if (!didDrag) {
+    // Click without drag = selection update. Shift-click toggles membership;
+    // plain click replaces the selection with the hit node (or clears it).
     const rect = canvas.getBoundingClientRect();
     const px = e.clientX - rect.left;
     const py = e.clientY - rect.top;
     const hit = hitTestVisible(px, py);
-    setSelection(hit ? hit.id : null);
+    if (e.shiftKey) {
+      if (hit) {
+        if (app.selectedNodeIds.has(hit.id)) app.selectedNodeIds.delete(hit.id);
+        else app.selectedNodeIds.add(hit.id);
+      }
+    } else {
+      app.selectedNodeIds.clear();
+      if (hit) app.selectedNodeIds.add(hit.id);
+    }
+    requestFrame();
     return;
   }
-
-  if (wasNodeDrag) {
-    // Persist manual positions for the dragged subtree + any modules
-    // displaced by push-apart.
-    const positions: Array<{ node_id: string; x: number; y: number }> = [];
-    for (const id of wasNodeDrag.movedIds) {
-      const n = store.get(id);
-      if (n) positions.push({ node_id: id, x: n.x, y: n.y });
+  if (wasNodeDrag && app.activeWorkspaceId && app.activeCanvasId) {
+    // Persist every moved node; cheap for Schematic-scale canvases.
+    for (const id of wasNodeDrag.nodeIds) {
+      const n = app.nodes.find((nn) => nn.id === id);
+      if (!n) continue;
+      void persistNodeMove(app.activeWorkspaceId, app.activeCanvasId, n.id, n.x, n.y);
     }
-    void persistPositions(positions);
   }
 });
 
@@ -345,7 +547,6 @@ window.addEventListener("mousemove", (e) => {
   const rect = canvas.getBoundingClientRect();
   cursorPx = e.clientX - rect.left;
   cursorPy = e.clientY - rect.top;
-
   if (drag) {
     const dx = e.clientX - lastX;
     const dy = e.clientY - lastY;
@@ -355,609 +556,162 @@ window.addEventListener("mousemove", (e) => {
       didDrag = true;
     }
     if (!didDrag) return;
-
     if (drag.kind === "viewport") {
       viewport = panBy(viewport, dx, dy);
       requestFrame();
       return;
     }
-
-    // Node drag: translate the dragged subtree to follow the cursor in
-    // data space, then run a single-pass AABB push-apart against other
-    // modules so siblings displace cleanly.
+    // drag.kind === "node" — pull into a local so the arrow callback below
+    // doesn't lose the narrowing. Moves every node in nodeIds by the same
+    // delta, preserving relative spacing across the dragged group.
+    const nodeDrag = drag;
     const { x: cx, y: cy } = pixelToData(viewport, cursorPx, cursorPy);
-    const totalDx = cx - drag.startDataX;
-    const totalDy = cy - drag.startDataY;
-    for (const id of drag.subtreeIds) {
-      const start = drag.startPositions.get(id);
-      const node = store.get(id);
-      if (!start || !node) continue;
-      node.x = start.x + totalDx;
-      node.y = start.y + totalDy;
+    const totalDx = cx - nodeDrag.startDataX;
+    const totalDy = cy - nodeDrag.startDataY;
+    for (const id of nodeDrag.nodeIds) {
+      const n = app.nodes.find((nn) => nn.id === id);
+      const start = nodeDrag.startPositions.get(id);
+      if (!n || !start) continue;
+      n.x = start.x + totalDx;
+      n.y = start.y + totalDy;
     }
-    resolvePushApart(drag);
-    rebuildBuffers();
     requestFrame();
     return;
   }
-
   if (cursorPx >= 0 && cursorPx <= viewport.width && cursorPy >= 0 && cursorPy <= viewport.height) {
-    const hit = hitTestVisible(cursorPx, cursorPy);
-    setHover(hit ? hit.id : null);
+    // Nodes take hit-test priority over edges — a cursor inside a node box
+    // is always "on the node" even if an edge wire passes through that box.
+    const nodeHit = hitTestVisible(cursorPx, cursorPy);
+    let edgeHit: string | null = null;
+    if (!nodeHit) {
+      const renderNodes = app.nodes.map(toRenderNode);
+      const renderEdges = app.edges.map(toRenderEdge);
+      // The adapter loses the CanvasEdge.id, so recover by position.
+      const hit = hitTestEdge(viewport, renderEdges, renderNodes, cursorPx, cursorPy);
+      if (hit) {
+        const idx = renderEdges.indexOf(hit);
+        if (idx >= 0 && app.edges[idx]) edgeHit = app.edges[idx].id;
+      }
+    }
+    const newNodeHover = nodeHit?.id ?? null;
+    if (newNodeHover !== app.hoveredNodeId || edgeHit !== app.hoveredEdgeId) {
+      app.hoveredNodeId = newNodeHover;
+      app.hoveredEdgeId = edgeHit;
+      canvas.style.cursor = newNodeHover || edgeHit ? "pointer" : "default";
+      requestFrame();
+    }
   } else {
-    setHover(null);
+    if (app.hoveredNodeId !== null || app.hoveredEdgeId !== null) {
+      app.hoveredNodeId = null;
+      app.hoveredEdgeId = null;
+      canvas.style.cursor = "default";
+      requestFrame();
+    }
   }
 });
 
-// Minimum-translation-vector push-apart between the dragged module and
-// every other top-level module. Resets sibling modules to their pre-drag
-// positions before resolving, so repeated drag motion doesn't compound
-// previous push deltas.
-function resolvePushApart(d: Extract<DragMode, { kind: "node" }>): void {
-  const dragged = store.get(d.rootId);
-  if (!dragged) return;
-
-  const modules = store.all().filter((n) => n.kind === "module");
-
-  for (const other of modules) {
-    if (other.id === d.rootId) continue;
-
-    // Reset to pre-drag so push deltas don't accumulate.
-    const start = d.startPositions.get(other.id);
-    if (start) {
-      const dx = start.x - other.x;
-      const dy = start.y - other.y;
-      other.x = start.x;
-      other.y = start.y;
-      if (other.children) {
-        for (const childId of other.children) {
-          const child = store.get(childId);
-          const childStart = d.startPositions.get(childId);
-          if (child && childStart) {
-            child.x = childStart.x;
-            child.y = childStart.y;
-          } else if (child) {
-            child.x += dx;
-            child.y += dy;
-          }
-        }
-      }
-    }
-    d.movedIds.delete(other.id);
-    if (other.children) for (const c of other.children) d.movedIds.delete(c);
-
-    // Now compute overlap against the (freshly positioned) dragged module.
-    const overlapX = Math.min(dragged.x + dragged.width, other.x + other.width)
-                   - Math.max(dragged.x, other.x);
-    const overlapY = Math.min(dragged.y + dragged.height, other.y + other.height)
-                   - Math.max(dragged.y, other.y);
-    if (overlapX <= 0 || overlapY <= 0) continue;
-
-    // Push along the shorter axis.
-    const sign = (a: number) => (a >= 0 ? 1 : -1);
-    let shiftX = 0, shiftY = 0;
-    if (overlapX < overlapY) {
-      const dir = sign((other.x + other.width / 2) - (dragged.x + dragged.width / 2));
-      shiftX = dir * (overlapX + 0.05);
-    } else {
-      const dir = sign((other.y + other.height / 2) - (dragged.y + dragged.height / 2));
-      shiftY = dir * (overlapY + 0.05);
-    }
-    other.x += shiftX;
-    other.y += shiftY;
-    d.movedIds.add(other.id);
-    if (other.children) {
-      for (const childId of other.children) {
-        const child = store.get(childId);
-        if (!child) continue;
-        child.x += shiftX;
-        child.y += shiftY;
-        d.movedIds.add(childId);
-      }
-    }
+async function persistNodeMove(
+  wid: string, cid: string, nid: string, x: number, y: number,
+): Promise<void> {
+  try {
+    await fetch(`${DAEMON_ORIGIN}/workspaces/${wid}/canvases/${cid}/nodes/${nid}`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ x, y }),
+    });
+  } catch {
+    // Peripheral — network failures here shouldn't surface to CC.
   }
 }
 
-async function persistPositions(positions: Array<{ node_id: string; x: number; y: number }>): Promise<void> {
-  if (!app.activeWorkspaceId) return;
-  const r = await fetch(`${DAEMON_ORIGIN}/workspaces/${app.activeWorkspaceId}/positions`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ positions }),
-  });
-  if (!r.ok) console.error("[schematic] persist positions failed:", r.status);
-}
-
-async function relayout(): Promise<void> {
-  if (!app.activeWorkspaceId) return;
-  if (!window.confirm("Re-layout will wipe all manually-placed modules. Continue?")) return;
-
-  // Show a placeholder immediately. Real extraction_progress events will
-  // overwrite this as they arrive; graph_ready clears it.
-  app.progress = { phase: "relayout", processed: 0, total: 0 };
-  requestFrame();
-
-  const r = await fetch(`${DAEMON_ORIGIN}/workspaces/${app.activeWorkspaceId}/relayout`, { method: "POST" });
-  if (!r.ok) {
-    app.progress = null;
-    requestFrame();
-    console.error("[schematic] relayout failed:", r.status);
-  }
-}
-
+// Accumulate wheel input so trackpad micro-deltas don't zoom in jumpy steps.
 const ZOOM_THRESHOLD = 80;
 const ZOOM_STEP_FACTOR = 1.08;
 let zoomAccum = 0;
-
-canvas.addEventListener(
-  "wheel",
-  (e) => {
-    e.preventDefault();
-    const rect = canvas.getBoundingClientRect();
-    const px = e.clientX - rect.left;
-    const py = e.clientY - rect.top;
-    const { x, y } = pixelToData(viewport, px, py);
-    zoomAccum += -e.deltaY;
-    const steps = Math.trunc(zoomAccum / ZOOM_THRESHOLD);
-    if (steps === 0) return;
-    zoomAccum -= steps * ZOOM_THRESHOLD;
-    const factor = Math.pow(ZOOM_STEP_FACTOR, steps);
-    viewport = zoom(viewport, x, y, factor);
-    requestFrame();
-  },
-  { passive: false },
-);
-
-document.addEventListener("keydown", (e) => {
-  if (e.code === "Escape") setSelection(null);
-  else if (e.code === "KeyF") {
-    e.preventDefault();
-    fitToCurrentNodes();
-    requestFrame();
+canvas.addEventListener("wheel", (e) => {
+  e.preventDefault();
+  zoomAccum += e.deltaY;
+  while (zoomAccum > ZOOM_THRESHOLD) {
+    viewport = zoom(viewport, 1 / ZOOM_STEP_FACTOR, cursorPx, cursorPy);
+    zoomAccum -= ZOOM_THRESHOLD;
   }
-});
-
-// Re-layout button rendered in the top-right corner via the overlay.
-// Bounds recomputed each frame and hit-tested on click.
-interface UIButton { x: number; y: number; w: number; h: number; label: string }
-let relayoutBtn: UIButton | null = null;
-
-canvas.addEventListener("click", (e) => {
-  if (!relayoutBtn) return;
-  const rect = canvas.getBoundingClientRect();
-  const px = e.clientX - rect.left;
-  const py = e.clientY - rect.top;
-  if (
-    px >= relayoutBtn.x && px <= relayoutBtn.x + relayoutBtn.w &&
-    py >= relayoutBtn.y && py <= relayoutBtn.y + relayoutBtn.h
-  ) {
-    void relayout();
+  while (zoomAccum < -ZOOM_THRESHOLD) {
+    viewport = zoom(viewport, ZOOM_STEP_FACTOR, cursorPx, cursorPy);
+    zoomAccum += ZOOM_THRESHOLD;
   }
-});
-
-// --- Render loop ---
-let frameQueued = false;
-
-function requestFrame(): void {
-  if (frameQueued) return;
-  frameQueued = true;
-  requestAnimationFrame(() => {
-    frameQueued = false;
-    maybeRebuildForTier();
-    const draws = [
-      ...(edgeBuffer ? edgeDraw(ctx, edgeBuffer) : []),
-      ...nodeDraws(ctx, nodeBuffers),
-    ];
-    render(ctx, viewport, draws);
-    drawOverlay();
-  });
-}
-
-function drawOverlay(): void {
-  clearOverlay(overlay);
-  const { ctx: c2d } = overlay;
-  c2d.font = "11px -apple-system, BlinkMacSystemFont, sans-serif";
-  c2d.fillStyle = "rgba(200, 200, 200, 0.6)";
-  c2d.textAlign = "left";
-  c2d.textBaseline = "top";
-  c2d.fillText(statusLine(), 8, 8);
-
-  // Module labels — always visible. At tier 0 they're the only identity
-  // signal; at tier 1 they label the module boxes that wrap files.
-  drawModuleLabels();
-  if (currentTier >= 1) drawFileLabels();
-  // Floating symbol popup appears when a file is selected and that file
-  // has any extracted symbols. Click off → setSelection(null) closes it.
-  drawSymbolPopup();
-
-  // Re-layout button in the top-right.
-  if (app.activeWorkspaceId) {
-    drawRelayoutButton();
-  } else {
-    relayoutBtn = null;
-  }
-
-  if (app.progress && app.progress.phase !== "ready") {
-    drawProgressOverlay(app.progress);
-  } else if (store.all().length === 0) {
-    c2d.font = "12px -apple-system, BlinkMacSystemFont, sans-serif";
-    c2d.fillStyle = "rgba(200, 200, 200, 0.35)";
-    c2d.textAlign = "center";
-    c2d.textBaseline = "middle";
-    c2d.fillText(
-      "no active workspace — run `schematic activate` in a repo",
-      overlay.canvas.clientWidth / 2,
-      overlay.canvas.clientHeight / 2,
-    );
-  }
-
-  if (hoveredNodeId !== null) {
-    const n = store.get(hoveredNodeId);
-    if (n) {
-      const lines: string[] = [n.name];
-      const metric = tooltipMetric(n);
-      if (metric !== "") lines.push(metric);
-      // Inline diagnostic per BUILDING_PLAN §8: when a node has errors or
-      // warnings, surface the first message in the hover tooltip so the
-      // user gets action-forcing feedback without opening a panel.
-      if (n.health === "error" || n.health === "warning") {
-        const label = n.health === "error" ? "✗" : "⚠";
-        const source = n.health_source ? ` (${n.health_source})` : "";
-        const detail = n.health_detail ?? "";
-        lines.push(`${label} ${detail}${source}`);
-      } else if (n.kind === "module" && (n.aggregated_health?.error ?? 0) > 0) {
-        lines.push(`✗ ${n.aggregated_health.error} errors in module`);
-      }
-      drawTooltip(overlay, cursorPx, cursorPy, lines);
-    }
-  }
-}
-
-function drawModuleLabels(): void {
-  const { ctx: c2d } = overlay;
-  const modules = store.all().filter((n) => n.kind === "module");
-  for (const m of modules) {
-    const topLeftPx = dataToPixel(viewport, m.x, m.y + m.height);
-    const wPx = (m.width / (viewport.xMax - viewport.xMin)) * viewport.width;
-
-    // Font size scales with the module's on-screen width. At tier 0 modules
-    // are the only visible identity, so we give them a big legible label;
-    // at tier 1+ the size damps so labels sit cleanly above the module.
-    const minFontSize = currentTier === 0 ? 14 : 11;
-    const maxFontSize = currentTier === 0 ? 30 : 15;
-    const fontSize = Math.min(maxFontSize, Math.max(minFontSize, wPx / 9));
-    c2d.font = `${fontSize}px -apple-system, BlinkMacSystemFont, sans-serif`;
-
-    // Header bar drawn ABOVE the module rectangle so it never overlaps
-    // files inside. Rounded dark pill with text inside; error badge on
-    // the same bar, right-aligned.
-    const labelText = m.name;
-    const textW = c2d.measureText(labelText).width;
-    const padX = 8;
-    const padY = 4;
-    const headerH = fontSize + padY * 2;
-    const gap = 4;
-
-    const errs = m.aggregated_health?.error ?? 0;
-    c2d.font = "10px -apple-system, BlinkMacSystemFont, sans-serif";
-    const errTextW = errs > 0 ? c2d.measureText(`${errs}`).width : 0;
-    const badgePad = 4;
-    const badgeW = errs > 0 ? errTextW + badgePad * 2 : 0;
-    const badgeGap = errs > 0 ? 6 : 0;
-
-    const barW = textW + padX * 2 + badgeGap + badgeW;
-    const barX = topLeftPx.px;
-    const barY = topLeftPx.py - headerH - gap;
-
-    // Pill background
-    c2d.fillStyle = currentTier === 0 ? "rgba(40, 40, 40, 0.92)" : "rgba(30, 30, 30, 0.82)";
-    roundPill(c2d, barX, barY, barW, headerH, 4);
-
-    // Label
-    c2d.font = `${fontSize}px -apple-system, BlinkMacSystemFont, sans-serif`;
-    c2d.fillStyle = currentTier === 0 ? "rgba(235, 235, 235, 0.98)" : "rgba(220, 220, 220, 0.92)";
-    c2d.textAlign = "left";
-    c2d.textBaseline = "middle";
-    c2d.fillText(labelText, barX + padX, barY + headerH / 2);
-
-    // Error badge inside the same bar
-    if (errs > 0) {
-      const bx = barX + padX + textW + badgeGap;
-      const by = barY + (headerH - 14) / 2;
-      c2d.fillStyle = "rgba(200, 60, 50, 0.95)";
-      roundPill(c2d, bx, by, badgeW, 14, 3);
-      c2d.fillStyle = "#fff";
-      c2d.font = "10px -apple-system, BlinkMacSystemFont, sans-serif";
-      c2d.textAlign = "left";
-      c2d.textBaseline = "middle";
-      c2d.fillText(`${errs}`, bx + badgePad, by + 7);
-    }
-  }
-}
-
-function drawFileLabels(): void {
-  const { ctx: c2d } = overlay;
-  const files = store.all().filter((n) => n.kind === "file");
-  for (const f of files) {
-    const widthPx = (f.width / (viewport.xMax - viewport.xMin)) * viewport.width;
-    const heightPx = (f.height / (viewport.yMax - viewport.yMin)) * viewport.height;
-    if (heightPx < 10 || widthPx < 40) continue;
-
-    // Font scales with on-screen box height — no cap — so labels grow
-    // proportionally with zoom. Lower bound keeps them readable at fit-to-
-    // screen; upper bound guards against filling the box with one line of
-    // text at extreme zoom (never more than ~60% of the box height).
-    const fontSize = Math.min(heightPx * 0.55, Math.max(10, heightPx * 0.45));
-    c2d.font = `${fontSize}px -apple-system, BlinkMacSystemFont, sans-serif`;
-    c2d.fillStyle = "rgba(240, 240, 240, 0.92)";
-    c2d.textAlign = "left";
-    c2d.textBaseline = "middle";
-
-    // Truncate if the label is wider than the box (common for long file
-    // paths when the user is barely zoomed in).
-    const maxTextWidth = widthPx - 12;
-    const label = truncate(c2d, f.name, maxTextWidth);
-
-    const centerY = dataToPixel(viewport, f.x, f.y + f.height / 2).py;
-    c2d.fillText(label, dataToPixel(viewport, f.x, f.y).px + 6, centerY);
-  }
-}
-
-function drawSymbolPopup(): void {
-  // Find the currently-selected file (if any).
-  const selected = store.all().find((n) => n.user_state === "selected");
-  if (!selected || selected.kind !== "file") return;
-
-  const symbols = store.all().filter((n) => n.kind === "symbol" && n.parent === selected.id);
-  if (symbols.length === 0) return;
-
-  const { ctx: c2d, canvas: c } = overlay;
-  const maxRows = Math.min(symbols.length, 16);
-  const rowH = 18;
-  const headerH = 22;
-  const paddingX = 10;
-  const paddingY = 6;
-
-  // Measure widest symbol label for panel sizing.
-  c2d.font = "11px -apple-system, BlinkMacSystemFont, sans-serif";
-  let maxTextW = c2d.measureText(selected.name).width;
-  for (const s of symbols.slice(0, maxRows)) {
-    const t = s.signature ? `${s.name} ${s.signature}` : s.name;
-    const w = c2d.measureText(t).width;
-    if (w > maxTextW) maxTextW = w;
-  }
-  const panelW = Math.min(380, Math.max(200, maxTextW + paddingX * 2));
-  const panelH = headerH + maxRows * rowH + paddingY * 2 + (symbols.length > maxRows ? rowH : 0);
-
-  // Anchor: right of the file, clamped inside the canvas.
-  const fileRight = dataToPixel(viewport, selected.x + selected.width, selected.y + selected.height);
-  let px = fileRight.px + 12;
-  let py = fileRight.py;
-  if (px + panelW + 8 > c.clientWidth) px = c.clientWidth - panelW - 8;
-  if (py + panelH + 8 > c.clientHeight) py = c.clientHeight - panelH - 8;
-  if (py < 8) py = 8;
-  if (px < 8) px = 8;
-
-  // Panel background
-  c2d.fillStyle = "rgba(25, 25, 25, 0.94)";
-  roundPill(c2d, px, py, panelW, panelH, 6);
-  c2d.strokeStyle = "rgba(255, 255, 255, 0.12)";
-  c2d.lineWidth = 1;
-  c2d.beginPath();
-  c2d.roundRect(px + 0.5, py + 0.5, panelW - 1, panelH - 1, 6);
-  c2d.stroke();
-
-  // Header (file name)
-  c2d.font = "11px -apple-system, BlinkMacSystemFont, sans-serif";
-  c2d.fillStyle = "rgba(220, 220, 220, 0.9)";
-  c2d.textAlign = "left";
-  c2d.textBaseline = "middle";
-  c2d.fillText(selected.name, px + paddingX, py + headerH / 2);
-
-  // Divider
-  c2d.strokeStyle = "rgba(255, 255, 255, 0.08)";
-  c2d.beginPath();
-  c2d.moveTo(px + paddingX, py + headerH);
-  c2d.lineTo(px + panelW - paddingX, py + headerH);
-  c2d.stroke();
-
-  // Symbol rows
-  c2d.font = "11px -apple-system, BlinkMacSystemFont, sans-serif";
-  let rowY = py + headerH + paddingY;
-  for (const s of symbols.slice(0, maxRows)) {
-    // Tiny colored dot indicating symbol kind.
-    const dotColor = dotColorForSymbol(s.symbol_kind);
-    c2d.fillStyle = dotColor;
-    c2d.beginPath();
-    c2d.arc(px + paddingX + 4, rowY + rowH / 2, 3, 0, Math.PI * 2);
-    c2d.fill();
-
-    // Name
-    c2d.fillStyle = "rgba(235, 235, 235, 0.95)";
-    c2d.fillText(s.name, px + paddingX + 14, rowY + rowH / 2);
-
-    // Signature, right-side, dim
-    if (s.signature) {
-      const maxSigWidth = panelW - paddingX * 2 - 14 - c2d.measureText(s.name).width - 6;
-      if (maxSigWidth > 40) {
-        const sigText = truncate(c2d, s.signature, maxSigWidth);
-        c2d.fillStyle = "rgba(170, 170, 170, 0.6)";
-        c2d.textAlign = "right";
-        c2d.fillText(sigText, px + panelW - paddingX, rowY + rowH / 2);
-        c2d.textAlign = "left";
-      }
-    }
-
-    rowY += rowH;
-  }
-
-  if (symbols.length > maxRows) {
-    c2d.fillStyle = "rgba(170, 170, 170, 0.55)";
-    c2d.fillText(`… and ${symbols.length - maxRows} more`, px + paddingX + 14, rowY + rowH / 2);
-  }
-}
-
-function dotColorForSymbol(kind: string | undefined): string {
-  switch (kind) {
-    case "function": return "rgba(90, 170, 140, 0.95)";
-    case "class": return "rgba(170, 130, 190, 0.95)";
-    case "interface": return "rgba(140, 140, 190, 0.95)";
-    case "type": return "rgba(130, 160, 175, 0.95)";
-    case "constant": return "rgba(160, 140, 110, 0.95)";
-    default: return "rgba(140, 140, 140, 0.9)";
-  }
-}
-
-function truncate(c2d: CanvasRenderingContext2D, s: string, maxWidth: number): string {
-  if (c2d.measureText(s).width <= maxWidth) return s;
-  const ell = "…";
-  let lo = 0, hi = s.length;
-  while (lo < hi) {
-    const mid = (lo + hi) >> 1;
-    if (c2d.measureText(s.slice(0, mid) + ell).width <= maxWidth) lo = mid + 1;
-    else hi = mid;
-  }
-  return s.slice(0, Math.max(0, lo - 1)) + ell;
-}
-
-function roundPill(c2d: CanvasRenderingContext2D, x: number, y: number, w: number, h: number, r: number): void {
-  const rr = Math.min(r, h / 2);
-  c2d.beginPath();
-  c2d.moveTo(x + rr, y);
-  c2d.lineTo(x + w - rr, y);
-  c2d.quadraticCurveTo(x + w, y, x + w, y + rr);
-  c2d.lineTo(x + w, y + h - rr);
-  c2d.quadraticCurveTo(x + w, y + h, x + w - rr, y + h);
-  c2d.lineTo(x + rr, y + h);
-  c2d.quadraticCurveTo(x, y + h, x, y + h - rr);
-  c2d.lineTo(x, y + rr);
-  c2d.quadraticCurveTo(x, y, x + rr, y);
-  c2d.closePath();
-  c2d.fill();
-}
-
-function drawRelayoutButton(): void {
-  const { ctx: c2d, canvas: c } = overlay;
-  const label = "↻ re-layout";
-  c2d.font = "11px -apple-system, BlinkMacSystemFont, sans-serif";
-  const padding = 8;
-  const textW = c2d.measureText(label).width;
-  const w = textW + padding * 2;
-  const h = 22;
-  const x = c.clientWidth - w - 8;
-  const y = 6;
-
-  c2d.fillStyle = "rgba(255, 255, 255, 0.06)";
-  c2d.fillRect(x, y, w, h);
-  c2d.strokeStyle = "rgba(255, 255, 255, 0.15)";
-  c2d.lineWidth = 1;
-  c2d.strokeRect(x + 0.5, y + 0.5, w - 1, h - 1);
-  c2d.fillStyle = "rgba(220, 220, 220, 0.85)";
-  c2d.textAlign = "left";
-  c2d.textBaseline = "middle";
-  c2d.fillText(label, x + padding, y + h / 2);
-
-  relayoutBtn = { x, y, w, h, label };
-}
-
-function drawProgressOverlay(p: ExtractionProgress): void {
-  const { ctx: c2d, canvas: c } = overlay;
-  const cx = c.clientWidth / 2;
-  const cy = c.clientHeight / 2;
-
-  // Full-screen dim so the map reads as "paused" during the operation.
-  c2d.fillStyle = "rgba(10, 10, 10, 0.55)";
-  c2d.fillRect(0, 0, c.clientWidth, c.clientHeight);
-
-  c2d.font = "13px -apple-system, BlinkMacSystemFont, sans-serif";
-  c2d.fillStyle = "rgba(220, 220, 220, 0.9)";
-  c2d.textAlign = "center";
-  c2d.textBaseline = "middle";
-  const label =
-    p.phase === "relayout"
-      ? "Re-layout in progress…"
-      : p.total > 0
-        ? `Indexing workspace — ${p.phase} ${p.processed} / ${p.total}`
-        : `Indexing workspace — ${p.phase}`;
-  c2d.fillText(label, cx, cy - 8);
-
-  const barW = 280;
-  const barH = 4;
-  const barX = cx - barW / 2;
-  const barY = cy + 8;
-  const frac = p.total > 0 ? Math.min(1, p.processed / p.total) : 0;
-  c2d.fillStyle = "rgba(255, 255, 255, 0.1)";
-  c2d.fillRect(barX, barY, barW, barH);
-  c2d.fillStyle = "rgba(212, 169, 58, 0.9)";
-  if (p.phase === "relayout") {
-    // Indeterminate bar: oscillating segment while the daemon works.
-    const t = (Date.now() / 600) % 1;
-    const segW = barW * 0.25;
-    const segX = barX + (barW - segW) * (0.5 + 0.5 * Math.sin(t * Math.PI * 2));
-    c2d.fillRect(segX, barY, segW, barH);
-    // Keep the frame loop alive so the animation ticks.
-    requestFrame();
-  } else {
-    c2d.fillRect(barX, barY, barW * frac, barH);
-  }
-}
-
-function statusLine(): string {
-  const ws = app.workspaces.find((w) => w.id === app.activeWorkspaceId);
-  const connTxt = app.connection === "open" ? "●" : app.connection === "connecting" ? "◐" : "○";
-  const wsTxt = ws ? `${ws.name} (${ws.state})` : "no workspace";
-  const count = store.all().length;
-  return `${connTxt} daemon  —  workspace: ${wsTxt}  —  ${count} nodes`;
-}
-
-function tooltipMetric(n: NodeState): string {
-  if (n.kind === "file") return n.line_count > 0 ? `${n.line_count} lines` : (n.language ?? "");
-  if (n.kind === "symbol" && n.signature) return n.signature;
-  if (n.kind === "module") return "module";
-  return "";
-}
-
-// --- Wire up GraphStore → render ---
-store.subscribe(() => {
-  rebuildBuffers();
   requestFrame();
-});
+}, { passive: false });
 
-// --- Bootstrap: discover a workspace and open a WS connection ---
+// ---------------------------------------------------------------------------
+// Bootstrap
+// ---------------------------------------------------------------------------
+
 async function bootstrap(): Promise<void> {
-  const wsList = await fetchWorkspaces();
-  app.workspaces = wsList;
+  app.workspaces = await fetchJSON<Workspace[]>("/workspaces");
 
+  // Precedence: ?w=<id> URL param, then daemon /focus, then first active.
   const urlParam = new URLSearchParams(window.location.search).get("w");
+  const focusResp = urlParam ? null : await fetchJSON<{ workspace_id: string | null }>("/focus").catch(() => null);
+  const focused = focusResp?.workspace_id ?? null;
   const chosen =
-    (urlParam && wsList.find((w) => w.id === urlParam)) ??
-    wsList.find((w) => w.state === "active") ??
+    (urlParam && app.workspaces.find((w) => w.id === urlParam)) ??
+    (focused && app.workspaces.find((w) => w.id === focused)) ??
+    app.workspaces.find((w) => w.state === "active") ??
     null;
-  app.activeWorkspaceId = chosen ? chosen.id : null;
 
-  if (chosen) {
-    await loadGraph(chosen.id);
-  }
+  await reloadWorkspaceScope(chosen ? chosen.id : null);
 
   const client = new DaemonWSClient({
     url: DAEMON_WS,
     ...(chosen ? { workspaceId: chosen.id } : {}),
     onEvent: (event) => {
-      if (event.type === "node.state_change") {
-        store.applyEvent(event, app.activeWorkspaceId);
-      } else if (event.type === "workspace.extraction_progress") {
-        if (event.workspace_id === app.activeWorkspaceId) {
-          app.progress = { phase: event.phase, processed: event.processed, total: event.total };
-          requestFrame();
+      // file.activity is the canvas-era activity signal; node.state_change
+      // from the old directory-render path is ignored.
+      if (event.type === "file.activity") {
+        if (event.workspace_id !== app.activeWorkspaceId) return;
+        app.fileActivity.set(event.file_path, event.activity);
+        requestFrame();
+        return;
+      }
+      if (event.type === "workspace.focused") {
+        if (event.workspace_id !== app.activeWorkspaceId) {
+          void reloadWorkspaceScope(event.workspace_id);
+          client.setWorkspace(event.workspace_id);
+          void refreshWorkspaces();
         }
-      } else if (event.type === "workspace.graph_ready") {
-        if (event.workspace_id === app.activeWorkspaceId) {
-          app.progress = null;
-          void loadGraph(event.workspace_id);
+        return;
+      }
+      if (event.type === "canvas.created") {
+        if (event.workspace_id !== app.activeWorkspaceId) return;
+        app.canvases = [...app.canvases, event.canvas];
+        renderTabs();
+        updateEmptyState();
+        return;
+      }
+      if (event.type === "canvas.updated") {
+        if (event.workspace_id !== app.activeWorkspaceId) return;
+        app.canvases = app.canvases.map((c) => (c.id === event.canvas.id ? event.canvas : c));
+        renderTabs();
+        return;
+      }
+      if (event.type === "canvas.deleted") {
+        if (event.workspace_id !== app.activeWorkspaceId) return;
+        app.canvases = app.canvases.filter((c) => c.id !== event.canvas_id);
+        if (app.activeCanvasId === event.canvas_id) {
+          app.activeCanvasId = null;
+          app.nodes = [];
+          app.edges = [];
+          const fallback = app.canvases[0];
+          if (fallback) void switchCanvas(fallback.id);
         }
-      } else if (event.type === "workspace.activated" || event.type === "workspace.resumed") {
-        // refresh workspaces list so status line reflects it
-        void fetchWorkspaces().then((list) => { app.workspaces = list; requestFrame(); });
+        renderTabs();
+        updateEmptyState();
+        requestFrame();
+        return;
+      }
+      if (event.type === "workspace.activated" || event.type === "workspace.resumed") {
+        void refreshWorkspaces();
+        return;
       }
     },
     onStateChange: (state) => {
@@ -968,24 +722,9 @@ async function bootstrap(): Promise<void> {
   client.connect();
 }
 
-async function loadGraph(workspaceId: string): Promise<void> {
-  const graph = await fetchWorkspaceGraph(workspaceId);
-  edges = graph.edges;
-  store.replaceAll(graph.nodes);
-  if (graph.nodes.length > 0) fitToCurrentNodes();
+async function refreshWorkspaces(): Promise<void> {
+  app.workspaces = await fetchJSON<Workspace[]>("/workspaces");
   requestFrame();
-}
-
-async function fetchWorkspaces(): Promise<Workspace[]> {
-  const r = await fetch(`${DAEMON_ORIGIN}/workspaces`);
-  if (!r.ok) throw new Error(`[schematic] /workspaces failed: ${r.status}`);
-  return r.json() as Promise<Workspace[]>;
-}
-
-async function fetchWorkspaceGraph(id: string): Promise<{ nodes: NodeState[]; edges: Edge[] }> {
-  const r = await fetch(`${DAEMON_ORIGIN}/workspaces/${id}/graph`);
-  if (!r.ok) throw new Error(`[schematic] /workspaces/${id}/graph failed: ${r.status}`);
-  return r.json() as Promise<{ nodes: NodeState[]; edges: Edge[] }>;
 }
 
 resize();

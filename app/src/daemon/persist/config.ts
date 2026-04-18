@@ -6,12 +6,16 @@ export interface SchematicConfig {
   port: number;
   ignored_paths: string[];
   welcome_shown: boolean;
+  // Which workspace the browser should display on cold boot. Updated every
+  // time POST /focus is called so daemon restarts don't drop the user's view.
+  focused_workspace_id: string | null;
 }
 
 const DEFAULT_CONFIG: SchematicConfig = {
   port: 7777,
   ignored_paths: [],
   welcome_shown: false,
+  focused_workspace_id: null,
 };
 
 export async function ensureSchematicHome(): Promise<void> {

@@ -1,10 +1,35 @@
 {
-  "name": "@schematic/app",
+  "name": "schematic",
   "version": "0.0.1",
-  "private": true,
+  "description": "Live architecture map companion for Claude Code — click a file in the browser, Claude knows what you mean.",
+  "keywords": [
+    "claude-code",
+    "claude",
+    "architecture",
+    "graph",
+    "mcp",
+    "hooks",
+    "typescript"
+  ],
+  "license": "MIT",
+  "author": "David Alan Brown",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/dvidartist-hub/Schematic.git"
+  },
+  "homepage": "https://github.com/dvidartist-hub/Schematic#readme",
+  "bugs": "https://github.com/dvidartist-hub/Schematic/issues",
   "type": "module",
   "bin": {
     "schematic": "./dist/cli/index.js"
+  },
+  "files": [
+    "dist/**",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=20"
   },
   "scripts": {
     "typecheck": "tsc --noEmit",

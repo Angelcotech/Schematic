@@ -2,8 +2,9 @@
 // and future per-workspace event logs.
 
 import type { HookPayload } from "./hook-payload.js";
-import type { NodeState } from "./node-state.js";
+import type { FileActivity } from "./file-activity.js";
 import type { Workspace } from "./workspace.js";
+import type { Canvas } from "./canvas.js";
 
 export type SchematicEvent =
   | { type: "workspace.activated"; workspace: Workspace; timestamp: number }
@@ -11,34 +12,43 @@ export type SchematicEvent =
   | { type: "workspace.resumed"; workspace_id: string; timestamp: number }
   | { type: "workspace.disabled"; workspace_id: string; timestamp: number }
   | { type: "workspace.forgotten"; workspace_id: string; timestamp: number }
+  | {
+      // Tells every browser tab which workspace to display. Fired when
+      // Claude (via MCP) or the user (via CLI/UI) changes focus. v1 uses
+      // a single global focus — one browser, one visible repo at a time.
+      type: "workspace.focused";
+      workspace_id: string;
+      timestamp: number;
+    }
   | { type: "hook.received"; workspace_id: string; payload: HookPayload; timestamp: number }
   | {
-      // A node appeared, was mutated, or decayed. The daemon sends the full
-      // NodeState (or `null` for removals) rather than a partial diff — v1
-      // keeps the wire simple; partials are a size optimization for later.
-      type: "node.state_change";
+      // File-level activity signal. The frontend looks up all canvas nodes
+      // referencing the same file_path on the active canvas and pulses them
+      // together — one file change, N visual pulses if it appears in N
+      // canvas nodes.
+      type: "file.activity";
       workspace_id: string;
-      node_id: string;
-      node: NodeState | null;
+      file_path: string;
+      activity: FileActivity;
       timestamp: number;
     }
   | {
-      // Streamed during extraction so the browser can show a progress bar.
-      type: "workspace.extraction_progress";
+      // Canvas lifecycle — so other browser tabs can refresh their canvas
+      // list when a canvas is created/renamed/deleted.
+      type: "canvas.created";
       workspace_id: string;
-      phase: "walk" | "modules" | "imports" | "symbols" | "layout" | "ready";
-      processed: number;
-      total: number;
+      canvas: Canvas;
       timestamp: number;
     }
   | {
-      // The daemon finished (re-)extracting and the stored graph changed.
-      // Browsers should re-fetch GET /workspaces/:id/graph to pick up the
-      // new structure. (We don't inline the graph in the event to keep WS
-      // frames small on bigger repos.)
-      type: "workspace.graph_ready";
+      type: "canvas.updated";
       workspace_id: string;
-      node_count: number;
-      edge_count: number;
+      canvas: Canvas;
+      timestamp: number;
+    }
+  | {
+      type: "canvas.deleted";
+      workspace_id: string;
+      canvas_id: string;
       timestamp: number;
     };

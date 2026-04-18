@@ -13,4 +13,5 @@ export interface Edge {
   kind: EdgeKind;
   highlighted: boolean;
   weight?: number;
+  label?: string;          // free-text relationship description rendered on the wire
 }

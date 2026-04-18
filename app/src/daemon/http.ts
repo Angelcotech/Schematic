@@ -12,23 +12,21 @@ import type { Workspace } from "../shared/workspace.js";
 import type { WorkspaceRegistry } from "./workspaces/registry.js";
 import type { WSBroadcaster } from "./ws.js";
 import { newWorkspace, route } from "./workspaces/router.js";
-import { deleteCache } from "./cache/graph-cache.js";
-import {
-  deletePositions,
-  readPositions,
-  writePositions,
-} from "./cache/positions.js";
-import type { NodeStoreRegistry } from "./node-store.js";
 import type { ActivationManager } from "./workspaces/activate.js";
-import { buildArchContext } from "./context/arch-context.js";
+import type { CanvasStoreRegistry } from "./canvas/store.js";
+import type { CanvasEdgeKind } from "../shared/canvas.js";
+import type { FileActivityRegistry } from "./file-activity.js";
+import { tryServeStatic } from "./static-web.js";
+import { readOrInitConfig, writeConfig } from "./persist/config.js";
 
 export interface DaemonContext {
   registry: WorkspaceRegistry;
-  nodeStores: NodeStoreRegistry;
+  canvasStores: CanvasStoreRegistry;
+  fileActivity: FileActivityRegistry;
   activations: ActivationManager;
   ws: WSBroadcaster;
   startedAt: number;
-  state: { eventCount: number };
+  state: { eventCount: number; focusedWorkspaceId: string | null };
 }
 
 export function createRequestHandler(
@@ -78,6 +76,32 @@ export function createRequestHandler(
         return json(res, 200, ctx.registry.all());
       }
 
+      // GET /focus — what workspace should the browser currently display.
+      if (method === "GET" && path === "/focus") {
+        return json(res, 200, { workspace_id: ctx.state.focusedWorkspaceId });
+      }
+
+      // POST /focus { workspace_id } — MCP/CLI tells the browser to switch.
+      // Broadcasts workspace.focused; frontend reloads the graph for that id.
+      // Persists to config.json so a daemon restart keeps the same view.
+      if (method === "POST" && path === "/focus") {
+        const body = JSON.parse(await readBody(req)) as { workspace_id: string };
+        if (!body.workspace_id) return err(res, 400, "missing field: workspace_id");
+        const ws = ctx.registry.get(body.workspace_id);
+        if (!ws) return err(res, 404, "unknown workspace");
+        ctx.state.focusedWorkspaceId = ws.id;
+        const cfg = await readOrInitConfig();
+        if (cfg.focused_workspace_id !== ws.id) {
+          cfg.focused_workspace_id = ws.id;
+          await writeConfig(cfg);
+        }
+        ctx.ws.broadcast(
+          { type: "workspace.focused", workspace_id: ws.id, timestamp: Date.now() },
+          ws.id,
+        );
+        return json(res, 200, { ok: true, workspace: ws });
+      }
+
       if (method === "POST" && path === "/workspaces") {
         const body = JSON.parse(await readBody(req)) as { path: string };
         const { path: rootPath } = body;
@@ -122,90 +146,205 @@ export function createRequestHandler(
         const id = idMatch[1];
         await ctx.registry.forget(id);
         ctx.activations.deactivate(id);
-        ctx.nodeStores.drop(id);
+        ctx.fileActivity.drop(id);
         ctx.ws.broadcast({ type: "workspace.forgotten", workspace_id: id, timestamp: Date.now() }, id);
         return json(res, 200, { ok: true });
       }
 
-      // /workspaces/:id/nodes — legacy endpoint kept for Stage 5 back-compat.
-      const nodesMatch = /^\/workspaces\/([^/]+)\/nodes$/.exec(path);
-      if (method === "GET" && nodesMatch) {
-        const id = nodesMatch[1];
-        const store = ctx.nodeStores.get(id);
-        return json(res, 200, store?.all() ?? []);
+      // (Stage 17c deleted /graph, /nodes, /selection, /positions, /relayout —
+      // all of those served the directory-render pathway. Canvas CRUD above
+      // replaces them.)
+
+      // --- Canvases -------------------------------------------------------
+      // Canvas CRUD is always scoped to a workspace to keep the URL path
+      // self-describing and avoid a reverse canvas→workspace index.
+
+      // GET /workspaces/:wid/canvases  — canvas metadata only (no nodes/edges).
+      const canvasListMatch = /^\/workspaces\/([^/]+)\/canvases$/.exec(path);
+      if (method === "GET" && canvasListMatch) {
+        const wid = canvasListMatch[1];
+        if (!ctx.registry.get(wid)) return err(res, 404, "unknown workspace");
+        const store = await ctx.canvasStores.getOrLoad(wid);
+        return json(res, 200, store.listCanvases());
       }
 
-      // /workspaces/:id/graph — full { nodes, edges } snapshot for the browser.
-      const graphMatch = /^\/workspaces\/([^/]+)\/graph$/.exec(path);
-      if (method === "GET" && graphMatch) {
-        const id = graphMatch[1];
-        const store = ctx.nodeStores.get(id);
-        return json(res, 200, {
-          nodes: store?.all() ?? [],
-          edges: store?.edges() ?? [],
-        });
+      // POST /workspaces/:wid/canvases  { name, description? }
+      if (method === "POST" && canvasListMatch) {
+        const wid = canvasListMatch[1];
+        if (!ctx.registry.get(wid)) return err(res, 404, "unknown workspace");
+        const body = JSON.parse(await readBody(req)) as {
+          name?: string;
+          description?: string;
+        };
+        if (typeof body.name !== "string" || body.name.length === 0) {
+          return err(res, 400, "missing field: name");
+        }
+        const store = await ctx.canvasStores.getOrLoad(wid);
+        const file = await store.createCanvas(body.name, body.description);
+        ctx.ws.broadcast(
+          { type: "canvas.created", workspace_id: wid, canvas: file.canvas, timestamp: Date.now() },
+          wid,
+        );
+        return json(res, 201, file);
       }
 
-      // /workspaces/:id/selection — POST { node_id: string | null }
-      // Frontend mirrors its current selection here so arch-context can
-      // read it on the next UserPromptSubmit.
-      const selectionMatch = /^\/workspaces\/([^/]+)\/selection$/.exec(path);
-      if (method === "POST" && selectionMatch) {
-        const id = selectionMatch[1];
-        const store = ctx.nodeStores.get(id);
-        if (!store) return err(res, 404, "unknown workspace");
-        const body = JSON.parse(await readBody(req)) as { node_id: string | null };
-        store.setSelection(body.node_id);
+      // GET /workspaces/:wid/canvases/:cid  — full canvas with nodes+edges.
+      const canvasIdMatch = /^\/workspaces\/([^/]+)\/canvases\/([^/]+)$/.exec(path);
+      if (method === "GET" && canvasIdMatch) {
+        const wid = canvasIdMatch[1];
+        const cid = canvasIdMatch[2];
+        if (!ctx.registry.get(wid)) return err(res, 404, "unknown workspace");
+        const store = await ctx.canvasStores.getOrLoad(wid);
+        return json(res, 200, store.getCanvas(cid));
+      }
+
+      // PATCH /workspaces/:wid/canvases/:cid  { name?, description? }
+      if (method === "PATCH" && canvasIdMatch) {
+        const wid = canvasIdMatch[1];
+        const cid = canvasIdMatch[2];
+        if (!ctx.registry.get(wid)) return err(res, 404, "unknown workspace");
+        const body = JSON.parse(await readBody(req)) as {
+          name?: string;
+          description?: string;
+        };
+        const store = await ctx.canvasStores.getOrLoad(wid);
+        const canvas = await store.updateCanvas(cid, body);
+        ctx.ws.broadcast(
+          { type: "canvas.updated", workspace_id: wid, canvas, timestamp: Date.now() },
+          wid,
+        );
+        return json(res, 200, canvas);
+      }
+
+      // DELETE /workspaces/:wid/canvases/:cid
+      if (method === "DELETE" && canvasIdMatch) {
+        const wid = canvasIdMatch[1];
+        const cid = canvasIdMatch[2];
+        if (!ctx.registry.get(wid)) return err(res, 404, "unknown workspace");
+        const store = await ctx.canvasStores.getOrLoad(wid);
+        await store.deleteCanvas(cid);
+        ctx.ws.broadcast(
+          { type: "canvas.deleted", workspace_id: wid, canvas_id: cid, timestamp: Date.now() },
+          wid,
+        );
         return json(res, 200, { ok: true });
       }
 
-      // /workspaces/:id/positions — POST { positions: [...] }
-      // Applies manual drag results, marks nodes as manually_positioned,
-      // and writes to positions.json so they survive daemon restart and
-      // re-extractions (per Invariant #6).
-      const positionsMatch = /^\/workspaces\/([^/]+)\/positions$/.exec(path);
-      if (method === "POST" && positionsMatch) {
-        const id = positionsMatch[1];
-        const store = ctx.nodeStores.get(id);
-        if (!store) return err(res, 404, "unknown workspace");
+      // POST /workspaces/:wid/canvases/:cid/nodes  — add node.
+      // Position (x, y) is optional; omitting it triggers auto-grid placement.
+      const nodeListMatch =
+        /^\/workspaces\/([^/]+)\/canvases\/([^/]+)\/nodes$/.exec(path);
+      if (method === "POST" && nodeListMatch) {
+        const wid = nodeListMatch[1];
+        const cid = nodeListMatch[2];
+        if (!ctx.registry.get(wid)) return err(res, 404, "unknown workspace");
         const body = JSON.parse(await readBody(req)) as {
-          positions: Array<{ node_id: string; x: number; y: number; width?: number; height?: number }>;
+          file_path?: string;
+          x?: number;
+          y?: number;
+          width?: number;
+          height?: number;
+          process?: string;
         };
-        store.applyPositions(body.positions);
-
-        // Merge with existing persisted overrides so a drag on one module
-        // doesn't wipe another's previously-saved position.
-        const existing = await readPositions(id);
-        for (const p of body.positions) {
-          const entry: { x: number; y: number; width?: number; height?: number } = {
-            x: p.x,
-            y: p.y,
-          };
-          if (p.width !== undefined) entry.width = p.width;
-          if (p.height !== undefined) entry.height = p.height;
-          existing[p.node_id] = entry;
+        if (typeof body.file_path !== "string" || body.file_path.length === 0) {
+          return err(res, 400, "missing field: file_path");
         }
-        await writePositions(id, existing);
-
-        return json(res, 200, { ok: true, updated: body.positions.length });
+        const store = await ctx.canvasStores.getOrLoad(wid);
+        const node = await store.addNode(cid, {
+          file_path: body.file_path,
+          ...(body.x !== undefined ? { x: body.x } : {}),
+          ...(body.y !== undefined ? { y: body.y } : {}),
+          ...(body.width !== undefined ? { width: body.width } : {}),
+          ...(body.height !== undefined ? { height: body.height } : {}),
+          ...(body.process !== undefined ? { process: body.process } : {}),
+        });
+        return json(res, 201, node);
       }
 
-      // /workspaces/:id/relayout — POST, wipes manual positions and triggers
-      // a fresh extraction.
-      const relayoutMatch = /^\/workspaces\/([^/]+)\/relayout$/.exec(path);
-      if (method === "POST" && relayoutMatch) {
-        const id = relayoutMatch[1];
-        const workspace = ctx.registry.get(id);
-        if (!workspace) return err(res, 404, "unknown workspace");
-        const store = ctx.nodeStores.get(id);
-        store?.clearManualPositions();
-        await deleteCache(id);
-        await deletePositions(id);
-        // Don't deactivate — fs watcher and health runners are long-lived
-        // infrastructure per workspace. Relayout only invalidates the
-        // extracted graph; activate() with `inProgress` guard safely
-        // re-extracts and preserves existing watchers/runners.
-        void ctx.activations.activate(workspace);
+      // PATCH /workspaces/:wid/canvases/:cid/nodes/:nid
+      // DELETE /workspaces/:wid/canvases/:cid/nodes/:nid
+      const nodeIdMatch =
+        /^\/workspaces\/([^/]+)\/canvases\/([^/]+)\/nodes\/([^/]+)$/.exec(path);
+      if (method === "PATCH" && nodeIdMatch) {
+        const wid = nodeIdMatch[1];
+        const cid = nodeIdMatch[2];
+        const nid = nodeIdMatch[3];
+        if (!ctx.registry.get(wid)) return err(res, 404, "unknown workspace");
+        const body = JSON.parse(await readBody(req)) as Record<string, unknown>;
+        const patch: Record<string, unknown> = {};
+        for (const k of ["x", "y", "width", "height", "process", "file_path"]) {
+          if (k in body) patch[k] = body[k];
+        }
+        const store = await ctx.canvasStores.getOrLoad(wid);
+        return json(res, 200, await store.updateNode(cid, nid, patch));
+      }
+      if (method === "DELETE" && nodeIdMatch) {
+        const wid = nodeIdMatch[1];
+        const cid = nodeIdMatch[2];
+        const nid = nodeIdMatch[3];
+        if (!ctx.registry.get(wid)) return err(res, 404, "unknown workspace");
+        const store = await ctx.canvasStores.getOrLoad(wid);
+        await store.deleteNode(cid, nid);
+        return json(res, 200, { ok: true });
+      }
+
+      // POST /workspaces/:wid/canvases/:cid/edges  { src, dst, label?, kind? }
+      const edgeListMatch =
+        /^\/workspaces\/([^/]+)\/canvases\/([^/]+)\/edges$/.exec(path);
+      if (method === "POST" && edgeListMatch) {
+        const wid = edgeListMatch[1];
+        const cid = edgeListMatch[2];
+        if (!ctx.registry.get(wid)) return err(res, 404, "unknown workspace");
+        const body = JSON.parse(await readBody(req)) as {
+          src?: string;
+          dst?: string;
+          label?: string;
+          kind?: string;
+        };
+        if (typeof body.src !== "string") return err(res, 400, "missing field: src");
+        if (typeof body.dst !== "string") return err(res, 400, "missing field: dst");
+        const kind = parseEdgeKind(body.kind);
+        if (kind === null) return err(res, 400, `invalid edge kind: ${String(body.kind)}`);
+        const store = await ctx.canvasStores.getOrLoad(wid);
+        const edge = await store.addEdge(cid, {
+          src: body.src,
+          dst: body.dst,
+          ...(body.label !== undefined ? { label: body.label } : {}),
+          ...(kind !== undefined ? { kind } : {}),
+        });
+        return json(res, 201, edge);
+      }
+
+      // PATCH /workspaces/:wid/canvases/:cid/edges/:eid
+      // DELETE /workspaces/:wid/canvases/:cid/edges/:eid
+      const edgeIdMatch =
+        /^\/workspaces\/([^/]+)\/canvases\/([^/]+)\/edges\/([^/]+)$/.exec(path);
+      if (method === "PATCH" && edgeIdMatch) {
+        const wid = edgeIdMatch[1];
+        const cid = edgeIdMatch[2];
+        const eid = edgeIdMatch[3];
+        if (!ctx.registry.get(wid)) return err(res, 404, "unknown workspace");
+        const body = JSON.parse(await readBody(req)) as {
+          label?: string;
+          kind?: string;
+        };
+        const patch: { label?: string; kind?: CanvasEdgeKind } = {};
+        if (body.label !== undefined) patch.label = body.label;
+        if (body.kind !== undefined) {
+          const parsedKind = parseEdgeKind(body.kind);
+          if (parsedKind === null) return err(res, 400, `invalid edge kind: ${String(body.kind)}`);
+          if (parsedKind !== undefined) patch.kind = parsedKind;
+        }
+        const store = await ctx.canvasStores.getOrLoad(wid);
+        return json(res, 200, await store.updateEdge(cid, eid, patch));
+      }
+      if (method === "DELETE" && edgeIdMatch) {
+        const wid = edgeIdMatch[1];
+        const cid = edgeIdMatch[2];
+        const eid = edgeIdMatch[3];
+        if (!ctx.registry.get(wid)) return err(res, 404, "unknown workspace");
+        const store = await ctx.canvasStores.getOrLoad(wid);
+        await store.deleteEdge(cid, eid);
         return json(res, 200, { ok: true });
       }
 
@@ -233,13 +372,38 @@ export function createRequestHandler(
         return json(res, 200, {});
       }
 
+      // Static frontend fallback — if no API route matched, try serving
+      // from the bundled web/ directory (installed alongside the daemon).
+      if (await tryServeStatic(req, res)) return;
+
       return err(res, 404, `unknown route: ${method} ${path}`);
     } catch (e) {
+      // Canvas store throws Error with code="ENOENT" for missing canvas/node/
+      // edge lookups — surface those as 404 instead of collapsing to 500.
+      const code = (e as NodeJS.ErrnoException).code;
+      if (code === "ENOENT") {
+        return err(res, 404, (e as Error).message);
+      }
       const message = (e as Error).message;
       console.error("[schematic] request error:", e);
       return err(res, 500, message);
     }
   };
+}
+
+// Strict edge-kind validator. The enum is fixed; "custom" is the escape
+// hatch for relationships the fixed vocabulary doesn't cover — label carries
+// the semantics in that case. Returns null for invalid, undefined for
+// absent, so endpoints can distinguish "not provided" from "rejected".
+const VALID_EDGE_KINDS = new Set<string>([
+  "calls", "imports", "reads", "writes", "control", "custom",
+]);
+function parseEdgeKind(v: unknown): CanvasEdgeKind | null | undefined {
+  if (v === undefined) return undefined;
+  if (typeof v === "string" && VALID_EDGE_KINDS.has(v)) {
+    return v as CanvasEdgeKind;
+  }
+  return null;
 }
 
 // Translates CC's stdin JSON into our strict HookPayload. Each hook event has
@@ -302,18 +466,13 @@ async function handleHook(ctx: DaemonContext, payload: HookPayload): Promise<Hoo
       { type: "workspace.activated", workspace, timestamp: Date.now() },
       workspace.id,
     );
-    // Fire-and-forget extraction. The hook that triggered activation returns
-    // immediately; progress + graph_ready events arrive over WS.
+    // Fire-and-forget activation — starts health runners, no extraction.
     void ctx.activations.activate(workspace).catch((e) =>
-      console.error(`[schematic] auto-activation extraction failed:`, e),
+      console.error(`[schematic] auto-activation failed:`, e),
     );
   }
 
-  // If no workspace exists and no marker is present, drop the hook. This is
-  // NOT a fallback — it is the designed state machine: hooks from unmarked
-  // cwds are silently ignored until explicit activation via CLI or UI.
   if (!workspace) return {};
-
   if (workspace.state !== "active") return {};
 
   await ctx.registry.touch(workspace.id);
@@ -322,35 +481,27 @@ async function handleHook(ctx: DaemonContext, payload: HookPayload): Promise<Hoo
     workspace.id,
   );
 
-  // Apply the hook to the workspace's bootstrap node store. Stage 6 replaces
-  // this with full graph extraction; until then this is how file-level
-  // activity becomes visible in the frontend.
-  const store = ctx.nodeStores.getOrCreate(workspace.id);
-  const change = store.applyHook(workspace, payload);
-  if (change) {
+  const activityStore = ctx.fileActivity.getOrCreate(workspace.id);
+  const activityChange = activityStore.applyHook(workspace, payload);
+  if (activityChange) {
     ctx.ws.broadcast(
       {
-        type: "node.state_change",
+        type: "file.activity",
         workspace_id: workspace.id,
-        node_id: change.id,
-        node: change.node,
+        file_path: activityChange.file_path,
+        activity: activityChange,
         timestamp: Date.now(),
       },
       workspace.id,
     );
   }
 
-  // Populate arch-context on UserPromptSubmit so Claude sees what the user
-  // is looking at. Only this event uses the additionalContext field.
+  // UserPromptSubmit returns additionalContext. In canvas mode we don't
+  // auto-inject a graph summary — CC authors canvases on demand. Keeping
+  // the handler arm in case we later want to surface "here are the
+  // canvases in this workspace" as context.
   if (payload.event === "UserPromptSubmit") {
-    const storeForCtx = ctx.nodeStores.get(workspace.id);
-    if (!storeForCtx) return {};
-    const additionalContext = buildArchContext({
-      workspace,
-      nodes: storeForCtx.all(),
-      edges: storeForCtx.edges(),
-    });
-    return { additionalContext };
+    return { additionalContext: "" };
   }
 
   return {};

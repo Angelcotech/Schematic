@@ -42,6 +42,10 @@ export async function install(): Promise<void> {
   console.log(`  Stop:      schematic stop`);
   console.log(`  Uninstall: schematic uninstall`);
   console.log("");
-  console.log("Open any Claude Code session and work normally.");
-  console.log("Repos with .schematic.json or .schematic/ will auto-activate.");
+  console.log("Just talk to Claude Code. Try:");
+  console.log('  "open ~/my-repo in schematic"');
+  console.log('  "switch schematic to gatestack pro"');
+  console.log('  "which files depend on app/src/daemon/http.ts?"');
+  console.log("");
+  console.log("Or use the CLI directly: schematic --help");
 }

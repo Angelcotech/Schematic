@@ -1,15 +1,16 @@
 {
-  "name": "schematic",
+  "name": "schematic-workspace",
   "version": "0.0.1",
   "private": true,
-  "description": "Live architecture map — reference surface for Claude Code",
+  "description": "Schematic — monorepo root (publishable package lives in app/)",
   "packageManager": "pnpm@9.0.0",
   "engines": {
     "node": ">=20"
   },
   "scripts": {
-    "build": "pnpm -r build",
+    "build": "pnpm --filter schematic build && pnpm --filter @schematic/frontend build && node scripts/copy-frontend.mjs",
     "dev": "pnpm --filter @schematic/frontend dev",
-    "typecheck": "pnpm -r --parallel typecheck"
+    "typecheck": "pnpm -r --parallel typecheck",
+    "pack:app": "pnpm --filter schematic pack"
   }
 }

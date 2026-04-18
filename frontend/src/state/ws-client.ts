@@ -23,8 +23,11 @@ export class DaemonWSClient {
   private attempt = 0;
   private reconnectTimer: number | null = null;
   private closedByUser = false;
+  private workspaceId: string | undefined;
 
-  constructor(private readonly opts: WSClientOptions) {}
+  constructor(private readonly opts: WSClientOptions) {
+    this.workspaceId = opts.workspaceId;
+  }
 
   connect(): void {
     this.closedByUser = false;
@@ -41,6 +44,15 @@ export class DaemonWSClient {
     this.socket = null;
   }
 
+  // Re-subscribe to a different workspace without dropping the socket. Used
+  // when MCP/CLI calls /focus and the browser needs to follow.
+  setWorkspace(id: string): void {
+    this.workspaceId = id;
+    if (this.socket?.readyState === WebSocket.OPEN) {
+      this.socket.send(JSON.stringify({ type: "subscribe", workspace_id: id }));
+    }
+  }
+
   private openSocket(): void {
     this.opts.onStateChange("connecting");
     const sock = new WebSocket(this.opts.url);
@@ -51,8 +63,8 @@ export class DaemonWSClient {
       this.opts.onStateChange("open");
       sock.send(
         JSON.stringify(
-          this.opts.workspaceId !== undefined
-            ? { type: "subscribe", workspace_id: this.opts.workspaceId }
+          this.workspaceId !== undefined
+            ? { type: "subscribe", workspace_id: this.workspaceId }
             : { type: "subscribe" },
         ),
       );

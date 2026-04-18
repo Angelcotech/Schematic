@@ -7,7 +7,6 @@
 
 import type { AiIntent, Health, NodeState } from "@shared/index.js";
 import type { GLContext } from "../webgl/renderer.js";
-import type { NodeStateWithHalo } from "./aggregation.js";
 
 interface Rect {
   x: number; y: number; w: number; h: number;
@@ -107,14 +106,10 @@ export function buildNodeBuffers(ctx: GLContext, nodes: NodeState[]): NodeBuffer
   for (const n of nodes) {
     const fillColor = colorForNode(n);
 
-    // Halo — leaf nodes use their own ai_intent. Modules at tier 0 roll up
-    // their most-recently-active child's intent via aggregation. Either way
-    // we look up in HALO_BY_INTENT.
-    const withHalo = n as NodeStateWithHalo;
-    const haloIntent: AiIntent | undefined =
-      n.ai_intent !== "idle" ? n.ai_intent
-      : n.kind === "module" && withHalo._aggregatedHaloIntent ? withHalo._aggregatedHaloIntent
-      : undefined;
+    // Halo — painted when a file (canvas node) is in a non-idle state.
+    // Module aggregation was a pre-canvas concept; each canvas node is
+    // file-level and has its own ai_intent.
+    const haloIntent: AiIntent | undefined = n.ai_intent !== "idle" ? n.ai_intent : undefined;
     const halo = haloIntent ? HALO_BY_INTENT[haloIntent] : null;
     if (halo) {
       const pad = n.kind === "module"

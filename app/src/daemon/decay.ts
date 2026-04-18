@@ -2,26 +2,26 @@
 // adaptive heuristics); an explicit clock demotes stale ai_intent values
 // toward idle and broadcasts the changes.
 
-import type { NodeStoreRegistry } from "./node-store.js";
+import type { FileActivityRegistry } from "./file-activity.js";
 import type { WSBroadcaster } from "./ws.js";
 
-const TICK_INTERVAL_MS = 10_000; // every 10s, re-evaluate all stores
+const TICK_INTERVAL_MS = 10_000;
 
 export function startDecayTick(
-  stores: NodeStoreRegistry,
+  fileActivity: FileActivityRegistry,
   ws: WSBroadcaster,
 ): () => void {
   const handle = setInterval(() => {
     const now = Date.now();
-    for (const [workspaceId, store] of stores.all()) {
+    for (const [workspaceId, store] of fileActivity.all()) {
       const changes = store.applyDecay(now);
-      for (const change of changes) {
+      for (const activity of changes) {
         ws.broadcast(
           {
-            type: "node.state_change",
+            type: "file.activity",
             workspace_id: workspaceId,
-            node_id: change.id,
-            node: change.node,
+            file_path: activity.file_path,
+            activity,
             timestamp: now,
           },
           workspaceId,
@@ -29,7 +29,7 @@ export function startDecayTick(
       }
     }
   }, TICK_INTERVAL_MS);
-  handle.unref(); // don't hold the event loop open for decay alone
+  handle.unref();
 
   return () => clearInterval(handle);
 }
