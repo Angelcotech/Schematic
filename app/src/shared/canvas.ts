@@ -19,6 +19,10 @@ export interface Canvas {
   description?: string;
   created_at: number;
   updated_at: number;
+  // Hidden canvases are still persisted but don't show in the tab bar.
+  // Closing a tab sets hidden=true; reopening via the toolbar menu flips
+  // it back. Separate from deletion — deleted canvases lose their data.
+  hidden?: boolean;
 }
 
 export interface CanvasNode {

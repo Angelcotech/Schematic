@@ -7,6 +7,8 @@
 // computed from the current node count, not random or tracked in a counter.
 
 import { randomUUID } from "node:crypto";
+import { access } from "node:fs/promises";
+import { join } from "node:path";
 import type {
   Canvas,
   CanvasEdge,
@@ -14,6 +16,82 @@ import type {
   CanvasFile,
   CanvasNode,
 } from "../../shared/canvas.js";
+
+// Shape returned by impactForFile — exported so the MCP tool layer
+// (which serializes it straight to Claude) can type-check against it.
+export interface ImpactEdge {
+  other_file_path: string;
+  other_node_id: string;
+  label?: string;
+  kind?: CanvasEdgeKind;
+}
+
+export interface ImpactInstance {
+  canvas_id: string;
+  canvas_name: string;
+  node_id: string;
+  process?: string;
+  incoming: ImpactEdge[];
+  outgoing: ImpactEdge[];
+}
+
+export interface ImpactReport {
+  file_path: string;
+  instances: ImpactInstance[];
+  summary: {
+    canvas_count: number;
+    instance_count: number;
+    incoming_edge_count: number;
+    outgoing_edge_count: number;
+    unique_incoming_files: number;
+    unique_outgoing_files: number;
+  };
+}
+
+export interface AuditReport {
+  canvas_id: string;
+  canvas_name: string;
+  // Files referenced by nodes on this canvas, bucketed by disk state.
+  // `missing` = no file at that path (canvas out of date or user moved/renamed).
+  // `duplicates` = the same file_path appears on more than one node instance.
+  //   (That's allowed by design — a file can legitimately appear multiple
+  //   times on a canvas — but it's worth surfacing so Claude can decide
+  //   whether it's intentional.)
+  missing: Array<{ node_id: string; file_path: string }>;
+  existing: Array<{ node_id: string; file_path: string }>;
+  duplicates: Array<{ file_path: string; node_ids: string[] }>;
+  summary: {
+    node_count: number;
+    missing_count: number;
+    duplicate_file_count: number;
+  };
+}
+
+export interface HubReport {
+  canvas_id: string;
+  canvas_name: string;
+  threshold: number;
+  hubs: Array<{
+    node_id: string;
+    file_path: string;
+    process?: string;
+    in_degree: number;
+    out_degree: number;
+    total_degree: number;
+  }>;
+}
+
+export interface OrphanReport {
+  canvas_id: string;
+  canvas_name: string;
+  orphans: Array<{ node_id: string; file_path: string; process?: string }>;
+}
+
+export interface CycleReport {
+  canvas_id: string;
+  canvas_name: string;
+  cycles: Array<Array<{ node_id: string; file_path: string }>>;
+}
 import {
   deleteCanvasFile,
   listCanvasIds,
@@ -66,6 +144,235 @@ export class CanvasStore {
     return Array.from(this.files.values()).map((f) => f.canvas);
   }
 
+  // Aggregate every occurrence of a file across every canvas in this
+  // workspace, with each instance's neighbor edges resolved back to their
+  // file_paths. Used by the trace_impact MCP tool so Claude can reason
+  // about blast radius before touching a file.
+  impactForFile(filePath: string): ImpactReport {
+    const instances: ImpactInstance[] = [];
+    let incomingEdgeCount = 0;
+    let outgoingEdgeCount = 0;
+    const canvasIds = new Set<string>();
+    const uniqueIncomingFiles = new Set<string>();
+    const uniqueOutgoingFiles = new Set<string>();
+
+    for (const file of this.files.values()) {
+      const matching = file.nodes.filter((n) => n.file_path === filePath);
+      if (matching.length === 0) continue;
+      canvasIds.add(file.canvas.id);
+
+      const byNodeId = new Map<string, CanvasNode>();
+      for (const n of file.nodes) byNodeId.set(n.id, n);
+
+      for (const node of matching) {
+        const incoming: ImpactEdge[] = [];
+        const outgoing: ImpactEdge[] = [];
+        for (const e of file.edges) {
+          if (e.dst === node.id) {
+            const src = byNodeId.get(e.src);
+            if (!src) continue;
+            incoming.push({
+              other_file_path: src.file_path,
+              other_node_id: src.id,
+              ...(e.label !== undefined ? { label: e.label } : {}),
+              ...(e.kind !== undefined ? { kind: e.kind } : {}),
+            });
+            uniqueIncomingFiles.add(src.file_path);
+            incomingEdgeCount++;
+          } else if (e.src === node.id) {
+            const dst = byNodeId.get(e.dst);
+            if (!dst) continue;
+            outgoing.push({
+              other_file_path: dst.file_path,
+              other_node_id: dst.id,
+              ...(e.label !== undefined ? { label: e.label } : {}),
+              ...(e.kind !== undefined ? { kind: e.kind } : {}),
+            });
+            uniqueOutgoingFiles.add(dst.file_path);
+            outgoingEdgeCount++;
+          }
+        }
+        instances.push({
+          canvas_id: file.canvas.id,
+          canvas_name: file.canvas.name,
+          node_id: node.id,
+          ...(node.process !== undefined ? { process: node.process } : {}),
+          incoming,
+          outgoing,
+        });
+      }
+    }
+
+    return {
+      file_path: filePath,
+      instances,
+      summary: {
+        canvas_count: canvasIds.size,
+        instance_count: instances.length,
+        incoming_edge_count: incomingEdgeCount,
+        outgoing_edge_count: outgoingEdgeCount,
+        unique_incoming_files: uniqueIncomingFiles.size,
+        unique_outgoing_files: uniqueOutgoingFiles.size,
+      },
+    };
+  }
+
+  // Walk every node on the canvas, stat its file_path against the workspace
+  // root, report which files are missing (stale canvas) vs present, and
+  // which file_paths appear on more than one node instance. MVP drift
+  // detection — no import-graph comparison in v1.
+  async auditCanvas(canvasId: string, workspaceRoot: string): Promise<AuditReport> {
+    const file = this.getCanvas(canvasId);
+    const missing: Array<{ node_id: string; file_path: string }> = [];
+    const existing: Array<{ node_id: string; file_path: string }> = [];
+    const byPath = new Map<string, string[]>();
+
+    for (const node of file.nodes) {
+      const absPath = join(workspaceRoot, node.file_path);
+      let exists = false;
+      try {
+        await access(absPath);
+        exists = true;
+      } catch {
+        exists = false;
+      }
+      if (exists) existing.push({ node_id: node.id, file_path: node.file_path });
+      else missing.push({ node_id: node.id, file_path: node.file_path });
+
+      let arr = byPath.get(node.file_path);
+      if (!arr) { arr = []; byPath.set(node.file_path, arr); }
+      arr.push(node.id);
+    }
+
+    const duplicates: Array<{ file_path: string; node_ids: string[] }> = [];
+    for (const [fp, ids] of byPath) {
+      if (ids.length > 1) duplicates.push({ file_path: fp, node_ids: ids });
+    }
+
+    return {
+      canvas_id: canvasId,
+      canvas_name: file.canvas.name,
+      missing,
+      existing,
+      duplicates,
+      summary: {
+        node_count: file.nodes.length,
+        missing_count: missing.length,
+        duplicate_file_count: duplicates.length,
+      },
+    };
+  }
+
+  // Nodes with high in+out degree. A quick way for Claude to identify
+  // keystone files — the ones that warrant extra care when changed.
+  findHubs(canvasId: string, minDegree: number): HubReport {
+    const file = this.getCanvas(canvasId);
+    const inDegree = new Map<string, number>();
+    const outDegree = new Map<string, number>();
+    for (const e of file.edges) {
+      outDegree.set(e.src, (outDegree.get(e.src) ?? 0) + 1);
+      inDegree.set(e.dst, (inDegree.get(e.dst) ?? 0) + 1);
+    }
+    const hubs = file.nodes
+      .map((n) => {
+        const inD = inDegree.get(n.id) ?? 0;
+        const outD = outDegree.get(n.id) ?? 0;
+        return {
+          node_id: n.id,
+          file_path: n.file_path,
+          ...(n.process !== undefined ? { process: n.process } : {}),
+          in_degree: inD,
+          out_degree: outD,
+          total_degree: inD + outD,
+        };
+      })
+      .filter((h) => h.total_degree >= minDegree)
+      .sort((a, b) => b.total_degree - a.total_degree);
+    return { canvas_id: canvasId, canvas_name: file.canvas.name, threshold: minDegree, hubs };
+  }
+
+  // Nodes with zero in and out edges. Either forgotten dependencies or
+  // placeholders that never got wired up.
+  findOrphans(canvasId: string): OrphanReport {
+    const file = this.getCanvas(canvasId);
+    const touched = new Set<string>();
+    for (const e of file.edges) {
+      touched.add(e.src);
+      touched.add(e.dst);
+    }
+    const orphans = file.nodes
+      .filter((n) => !touched.has(n.id))
+      .map((n) => ({
+        node_id: n.id,
+        file_path: n.file_path,
+        ...(n.process !== undefined ? { process: n.process } : {}),
+      }));
+    return { canvas_id: canvasId, canvas_name: file.canvas.name, orphans };
+  }
+
+  // All simple directed cycles on the canvas, via DFS with a recursion
+  // stack. Short cycles are usually design smells (circular imports, etc).
+  findCycles(canvasId: string): CycleReport {
+    const file = this.getCanvas(canvasId);
+    const out = new Map<string, string[]>();
+    for (const e of file.edges) {
+      let arr = out.get(e.src);
+      if (!arr) { arr = []; out.set(e.src, arr); }
+      arr.push(e.dst);
+    }
+    const byId = new Map<string, CanvasNode>();
+    for (const n of file.nodes) byId.set(n.id, n);
+
+    const cycles: string[][] = [];
+    const seen = new Set<string>();  // globally finished nodes
+    const onStack = new Set<string>();
+    const stack: string[] = [];
+
+    function dfs(nodeId: string): void {
+      if (onStack.has(nodeId)) {
+        // Found a cycle; extract the slice of `stack` from this node on.
+        const startIdx = stack.indexOf(nodeId);
+        if (startIdx >= 0) cycles.push(stack.slice(startIdx));
+        return;
+      }
+      if (seen.has(nodeId)) return;
+      onStack.add(nodeId);
+      stack.push(nodeId);
+      const next = out.get(nodeId) ?? [];
+      for (const n of next) dfs(n);
+      stack.pop();
+      onStack.delete(nodeId);
+      seen.add(nodeId);
+    }
+
+    for (const n of file.nodes) dfs(n.id);
+
+    // Deduplicate — the same cycle can be discovered starting from
+    // different points. Canonicalize by rotating so each cycle starts at
+    // its lexicographically smallest node id.
+    const deduped = new Map<string, string[]>();
+    for (const cyc of cycles) {
+      if (cyc.length === 0) continue;
+      const minIdx = cyc.reduce((min, id, i) => (id < cyc[min] ? i : min), 0);
+      const canonical = cyc.slice(minIdx).concat(cyc.slice(0, minIdx));
+      deduped.set(canonical.join("→"), canonical);
+    }
+
+    return {
+      canvas_id: canvasId,
+      canvas_name: file.canvas.name,
+      cycles: Array.from(deduped.values()).map((cyc) =>
+        cyc.map((id) => {
+          const node = byId.get(id);
+          return {
+            node_id: id,
+            file_path: node?.file_path ?? "(unknown)",
+          };
+        }),
+      ),
+    };
+  }
+
   getCanvas(canvasId: string): CanvasFile {
     const file = this.files.get(canvasId);
     if (!file) notFound("canvas", canvasId);
@@ -90,11 +397,15 @@ export class CanvasStore {
 
   async updateCanvas(
     canvasId: string,
-    patch: { name?: string; description?: string },
+    patch: { name?: string; description?: string; hidden?: boolean },
   ): Promise<Canvas> {
     const file = this.getCanvas(canvasId);
     if (patch.name !== undefined) file.canvas.name = patch.name;
     if (patch.description !== undefined) file.canvas.description = patch.description;
+    if (patch.hidden !== undefined) {
+      if (patch.hidden) file.canvas.hidden = true;
+      else delete file.canvas.hidden;
+    }
     file.canvas.updated_at = Date.now();
     await writeCanvasFile(this.workspaceId, file);
     return file.canvas;

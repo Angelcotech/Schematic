@@ -40,8 +40,13 @@ import {
   nodeDraws,
   type NodeBuffers,
 } from "./graph/node-renderer.js";
-import { drawEdges2D, hitTestEdge } from "./graph/edge-renderer-2d.js";
-import { drawProcessGroups } from "./graph/process-renderer.js";
+import {
+  drawEdges2D,
+  hitTestEdge,
+  LEGEND_EDGE_KINDS,
+} from "./graph/edge-renderer-2d.js";
+import { drawProcessGroups, hitTestProcessGroup } from "./graph/process-renderer.js";
+import { LEGEND_LANGUAGES, LEGEND_HALO } from "./graph/node-renderer.js";
 import { hitTest } from "./graph/hit-test.js";
 import { DaemonWSClient, type ConnectionState } from "./state/ws-client.js";
 
@@ -61,6 +66,12 @@ const container = canvas.parentElement;
 if (!container) throw new Error("[schematic] canvas has no parent");
 const tabbarEl = requireEl<HTMLDivElement>("tabbar");
 const emptyStateEl = requireEl<HTMLDivElement>("empty-state");
+const legendEl = requireEl<HTMLDivElement>("legend");
+const legendBtn = requireEl<HTMLDivElement>("legend-btn");
+const closedPanelEl = requireEl<HTMLDivElement>("closed-panel");
+const closedBtn = requireEl<HTMLDivElement>("closed-btn");
+const ccActivityEl = requireEl<HTMLDivElement>("cc-activity");
+const ccActivityText = requireEl<HTMLSpanElement>("cc-activity-text");
 
 const ctx = initGL(canvas);
 const overlay = createOverlay(container);
@@ -88,6 +99,17 @@ interface AppState {
   hoveredNodeId: string | null;
   hoveredEdgeId: string | null;
 
+  // Tracks the most recent Claude Code hook so the toolbar can surface
+  // "which CC session is working in which repo right now." Session id is
+  // the stable identifier CC assigns per conversation.
+  lastCCActivity: {
+    session_id: string;
+    workspace_id: string;
+    cwd: string;
+    tool: string | null;
+    timestamp: number;
+  } | null;
+
   connection: ConnectionState;
 }
 
@@ -102,6 +124,7 @@ const app: AppState = {
   selectedNodeIds: new Set(),
   hoveredNodeId: null,
   hoveredEdgeId: null,
+  lastCCActivity: null,
   connection: "closed",
 };
 
@@ -230,6 +253,17 @@ function renderAll(): void {
   // Edges next so labels and halos paint on top.
   drawEdges2D(c2d, viewport, renderEdges, renderNodes);
 
+  // Mask: punch transparent holes at every node's bounding box so any
+  // edge that routes through a box visually disappears inside it — the
+  // WebGL node fill (below the overlay) shows through cleanly. Cheaper
+  // than real obstacle avoidance and gets the same visual result:
+  // wires appear to run behind boxes, never across their labels.
+  for (const cn of app.nodes) {
+    const tl = dataToPixel(viewport, cn.x, cn.y + cn.height);
+    const br = dataToPixel(viewport, cn.x + cn.width, cn.y);
+    c2d.clearRect(tl.px, tl.py, br.px - tl.px, br.py - tl.py);
+  }
+
   drawStatusLine(c2d);
   drawNodeLabels(c2d);
 
@@ -320,13 +354,35 @@ function drawEdgeHoverTooltip(_c2d: CanvasRenderingContext2D): void {
 // Tab bar (DOM-managed, not canvas-2D — click handling is free this way)
 // ---------------------------------------------------------------------------
 
+function visibleCanvases(): Canvas[] {
+  return app.canvases.filter((c) => !c.hidden);
+}
+
+function hiddenCanvases(): Canvas[] {
+  return app.canvases.filter((c) => !!c.hidden);
+}
+
 function renderTabs(): void {
   tabbarEl.innerHTML = "";
-  for (const cv of app.canvases) {
+  for (const cv of visibleCanvases()) {
     const chip = document.createElement("div");
     chip.className = "tab" + (cv.id === app.activeCanvasId ? " active" : "");
-    chip.textContent = cv.name;
     chip.title = cv.description ?? "";
+
+    const label = document.createElement("span");
+    label.textContent = cv.name;
+    chip.appendChild(label);
+
+    const close = document.createElement("span");
+    close.className = "close";
+    close.textContent = "×";
+    close.title = "Close tab (reopen from the Closed menu)";
+    close.addEventListener("click", (e) => {
+      e.stopPropagation();
+      void closeCanvas(cv.id);
+    });
+    chip.appendChild(close);
+
     chip.addEventListener("click", () => {
       if (cv.id === app.activeCanvasId) return;
       void switchCanvas(cv.id);
@@ -341,6 +397,68 @@ function renderTabs(): void {
     void createCanvasPrompt();
   });
   tabbarEl.appendChild(add);
+
+  // Toggle the "Closed" button based on whether there's anything to reopen.
+  const hiddenCount = hiddenCanvases().length;
+  closedBtn.style.display = hiddenCount > 0 ? "" : "none";
+  closedBtn.textContent = `Closed (${hiddenCount})`;
+}
+
+async function closeCanvas(canvasId: string): Promise<void> {
+  if (!app.activeWorkspaceId) return;
+  // Optimistic: flip locally so the tab disappears immediately; the
+  // canvas.updated event from the daemon will reconcile.
+  const cv = app.canvases.find((c) => c.id === canvasId);
+  if (cv) cv.hidden = true;
+
+  // If the closed canvas was active, switch to another visible one.
+  if (app.activeCanvasId === canvasId) {
+    const fallback = visibleCanvases()[0];
+    app.activeCanvasId = fallback ? fallback.id : null;
+    app.nodes = [];
+    app.edges = [];
+    app.selectedNodeIds.clear();
+    if (fallback) void switchCanvas(fallback.id);
+  }
+  renderTabs();
+  updateEmptyState();
+  requestFrame();
+
+  try {
+    await fetch(`${DAEMON_ORIGIN}/workspaces/${app.activeWorkspaceId}/canvases/${canvasId}`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ hidden: true }),
+    });
+  } catch {
+    // If the PATCH fails, the daemon didn't persist hidden=true. Revert.
+    if (cv) cv.hidden = false;
+    renderTabs();
+  }
+}
+
+async function reopenCanvas(canvasId: string): Promise<void> {
+  if (!app.activeWorkspaceId) return;
+  const cv = app.canvases.find((c) => c.id === canvasId);
+  if (cv) cv.hidden = false;
+  renderTabs();
+  updateEmptyState();
+
+  try {
+    await fetch(`${DAEMON_ORIGIN}/workspaces/${app.activeWorkspaceId}/canvases/${canvasId}`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ hidden: false }),
+    });
+  } catch {
+    if (cv) cv.hidden = true;
+    renderTabs();
+    return;
+  }
+
+  // Auto-switch into the reopened canvas so it's immediately usable.
+  await switchCanvas(canvasId);
+  setClosedPanelOpen(false);
 }
 
 function updateEmptyState(): void {
@@ -348,25 +466,279 @@ function updateEmptyState(): void {
     app.activeWorkspaceId && app.canvases.length === 0 ? "flex" : "none";
 }
 
-async function createCanvasPrompt(): Promise<void> {
-  if (!app.activeWorkspaceId) return;
-  const name = window.prompt("Canvas name?");
-  if (!name) return;
-  const r = await fetch(
-    `${DAEMON_ORIGIN}/workspaces/${app.activeWorkspaceId}/canvases`,
-    {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ name }),
-    },
-  );
-  if (!r.ok) {
-    console.error("[schematic] create canvas failed:", r.status);
+// --- Legend (dropdown from the toolbar) --------------------------------
+
+let legendOpen = false;
+
+function renderLegend(): void {
+  const edgeRows = LEGEND_EDGE_KINDS
+    .map((e) => `
+      <div class="row">
+        <span class="swatch line" style="background:${e.color}"></span>
+        <span>${e.label}</span>
+      </div>`)
+    .join("");
+  const langRows = LEGEND_LANGUAGES
+    .map((l) => `
+      <div class="row">
+        <span class="swatch" style="background:${l.color}"></span>
+        <span>${l.label}</span>
+      </div>`)
+    .join("");
+  const haloRows = LEGEND_HALO
+    .map((h) => `
+      <div class="row">
+        <span class="swatch halo" style="background:${h.color}"></span>
+        <span>${h.label}</span>
+      </div>`)
+    .join("");
+
+  legendEl.innerHTML = `
+    <section>
+      <h4>Edges</h4>
+      ${edgeRows}
+    </section>
+    <section>
+      <h4>Language accent</h4>
+      ${langRows}
+    </section>
+    <section>
+      <h4>Activity halos</h4>
+      ${haloRows}
+    </section>`;
+}
+
+function setLegendOpen(open: boolean): void {
+  legendOpen = open;
+  legendEl.style.display = open ? "block" : "none";
+  legendBtn.classList.toggle("open", open);
+  if (open) setClosedPanelOpen(false);
+}
+
+legendBtn.addEventListener("click", (e) => {
+  e.stopPropagation();
+  setLegendOpen(!legendOpen);
+});
+
+renderLegend();
+
+// --- Closed (reopen-tab) menu ------------------------------------------
+
+let closedPanelOpen = false;
+
+function renderClosedPanel(): void {
+  const hidden = hiddenCanvases();
+  if (hidden.length === 0) {
+    closedPanelEl.innerHTML = `<div class="empty">No closed tabs.</div>`;
     return;
   }
-  // canvas.created event will refresh the tab bar; we'll switch to it too.
-  const file = (await r.json()) as { canvas: Canvas };
-  await switchCanvas(file.canvas.id);
+  // Most-recently-updated first — the most intuitive ordering for
+  // "recently closed" even though we store closed state as a flag rather
+  // than a timestamp.
+  const sorted = [...hidden].sort((a, b) => b.updated_at - a.updated_at);
+  closedPanelEl.innerHTML = sorted
+    .map((c) => `
+      <div class="item" data-cid="${c.id}">
+        <span>${escapeHtml(c.name)}</span>
+        <span class="reopen">reopen</span>
+      </div>`)
+    .join("");
+  for (const el of closedPanelEl.querySelectorAll<HTMLDivElement>(".item")) {
+    const cid = el.getAttribute("data-cid");
+    if (!cid) continue;
+    el.addEventListener("click", () => void reopenCanvas(cid));
+  }
+}
+
+function setClosedPanelOpen(open: boolean): void {
+  closedPanelOpen = open;
+  if (open) renderClosedPanel();
+  closedPanelEl.style.display = open ? "block" : "none";
+  closedBtn.classList.toggle("open", open);
+  if (open) setLegendOpen(false);
+}
+
+closedBtn.addEventListener("click", (e) => {
+  e.stopPropagation();
+  setClosedPanelOpen(!closedPanelOpen);
+});
+
+// Document-level click handler dismisses whichever dropdown is open when
+// the click lands outside both.
+document.addEventListener("click", (e) => {
+  const target = e.target as Node;
+  if (legendOpen && !legendEl.contains(target) && !legendBtn.contains(target)) {
+    setLegendOpen(false);
+  }
+  if (closedPanelOpen && !closedPanelEl.contains(target) && !closedBtn.contains(target)) {
+    setClosedPanelOpen(false);
+  }
+});
+
+function escapeHtml(s: string): string {
+  return s
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;");
+}
+
+// --- CC activity indicator --------------------------------------------
+// Freshness thresholds. Under 15s = live ("CC is active right now"),
+// under 2min = stale ("session is open but idle"), older = idle.
+const CC_FRESH_MS = 15_000;
+const CC_STALE_MS = 120_000;
+
+function renderCCActivity(): void {
+  const a = app.lastCCActivity;
+  if (!a) {
+    ccActivityEl.style.display = "none";
+    return;
+  }
+  const ws = app.workspaces.find((w) => w.id === a.workspace_id);
+  const wsName = ws?.name ?? "(unknown repo)";
+  const shortSession = a.session_id.slice(0, 8);
+
+  const age = Date.now() - a.timestamp;
+  ccActivityEl.classList.remove("stale", "idle");
+  if (age > CC_STALE_MS) ccActivityEl.classList.add("idle");
+  else if (age > CC_FRESH_MS) ccActivityEl.classList.add("stale");
+
+  ccActivityText.textContent = `CC: ${wsName}`;
+  ccActivityEl.title =
+    `CC session ${shortSession}…\n` +
+    `Repo: ${wsName}\n` +
+    `cwd: ${a.cwd}\n` +
+    (a.tool ? `Last tool: ${a.tool}\n` : "") +
+    `Last hook: ${new Date(a.timestamp).toLocaleTimeString()}`;
+  ccActivityEl.style.display = "flex";
+}
+
+// Re-render every second so the fresh/stale/idle dot reflects real time
+// even when no new hooks arrive. Cheap — just toggles a class and updates
+// the tooltip string; no render loop involved.
+window.setInterval(renderCCActivity, 1000);
+
+// --- Create-canvas modal ------------------------------------------------
+// Replaces the old window.prompt. Collects a canvas name + a description
+// of what the user wants to see mapped, creates the canvas, and copies a
+// Schematic-optimized prompt to the clipboard for the user to paste into
+// Claude Code. CC then authors the canvas using the MCP tools.
+
+const createModal = requireEl<HTMLDivElement>("create-modal");
+const createName = requireEl<HTMLInputElement>("create-name");
+const createDesc = requireEl<HTMLTextAreaElement>("create-desc");
+const createCancelBtn = requireEl<HTMLButtonElement>("create-cancel");
+const createSubmitBtn = requireEl<HTMLButtonElement>("create-submit");
+const toastEl = requireEl<HTMLDivElement>("toast");
+
+let toastTimer: number | null = null;
+function showToast(message: string, durationMs = 4000): void {
+  toastEl.textContent = message;
+  toastEl.style.display = "block";
+  if (toastTimer !== null) clearTimeout(toastTimer);
+  toastTimer = window.setTimeout(() => {
+    toastEl.style.display = "none";
+    toastTimer = null;
+  }, durationMs);
+}
+
+function openCreateModal(): void {
+  createName.value = "";
+  createDesc.value = "";
+  createModal.style.display = "flex";
+  createName.focus();
+}
+
+function closeCreateModal(): void {
+  createModal.style.display = "none";
+}
+
+createCancelBtn.addEventListener("click", closeCreateModal);
+createModal.addEventListener("click", (e) => {
+  // Click on the backdrop (not the panel) dismisses.
+  if (e.target === createModal) closeCreateModal();
+});
+document.addEventListener("keydown", (e) => {
+  if (e.key === "Escape" && createModal.style.display !== "none") closeCreateModal();
+});
+createSubmitBtn.addEventListener("click", () => void submitCreateModal());
+
+function createCanvasPrompt(): void {
+  if (!app.activeWorkspaceId) return;
+  openCreateModal();
+}
+
+function buildAuthoringPrompt(
+  canvasName: string,
+  canvasId: string,
+  description: string,
+): string {
+  const trimmed = description.trim();
+  const task = trimmed.length > 0
+    ? `What to map: ${trimmed}`
+    : `(no description provided)`;
+  return [
+    `Please populate the Schematic canvas I just created.`,
+    ``,
+    `Canvas: "${canvasName}" (id: ${canvasId})`,
+    task,
+    ``,
+    `Read the relevant files first, then use the Schematic MCP tools to author the diagram:`,
+    `- add_node(canvas_id, file_path, x, y, process?) for each file that belongs on the diagram`,
+    `- add_edge(canvas_id, src, dst, label?, kind?) for each relationship`,
+    ``,
+    `Layout: arrange by data flow (inputs on the left, outputs on the right). Group related files with the \`process\` argument. Don't stack files vertically in one column.`,
+    ``,
+    `Edges: label each relationship in a few words (e.g. "loads buffers", "authenticates via"). Kind is one of: calls, imports, reads, writes, control, custom.`,
+  ].join("\n");
+}
+
+async function submitCreateModal(): Promise<void> {
+  if (!app.activeWorkspaceId) return;
+  const name = createName.value.trim();
+  const description = createDesc.value.trim();
+  if (name.length === 0) {
+    createName.focus();
+    return;
+  }
+
+  createSubmitBtn.disabled = true;
+  try {
+    const body: { name: string; description?: string } = { name };
+    if (description) body.description = description;
+    const r = await fetch(
+      `${DAEMON_ORIGIN}/workspaces/${app.activeWorkspaceId}/canvases`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      },
+    );
+    if (!r.ok) {
+      console.error("[schematic] create canvas failed:", r.status);
+      showToast("Canvas creation failed.");
+      return;
+    }
+    const file = (await r.json()) as { canvas: Canvas };
+
+    // Build + copy the curated prompt. Clipboard requires a user gesture,
+    // which we have (the submit click).
+    const prompt = buildAuthoringPrompt(file.canvas.name, file.canvas.id, description);
+    try {
+      await navigator.clipboard.writeText(prompt);
+      showToast("Prompt copied. Paste into Claude Code to build the canvas.");
+    } catch {
+      // Clipboard write failed — show the prompt inline so user can grab it.
+      showToast("Created. Clipboard blocked; open the console to copy the prompt.");
+      console.log("[schematic] canvas prompt:\n" + prompt);
+    }
+
+    closeCreateModal();
+    await switchCanvas(file.canvas.id);
+  } finally {
+    createSubmitBtn.disabled = false;
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -390,7 +762,9 @@ async function reloadWorkspaceScope(workspaceId: string | null): Promise<void> {
 
   if (workspaceId) {
     app.canvases = await fetchJSON<Canvas[]>(`/workspaces/${workspaceId}/canvases`);
-    const initial = app.canvases[0];
+    // Start on the first VISIBLE canvas — hidden ones are waiting in the
+    // Closed menu.
+    const initial = visibleCanvases()[0];
     if (initial) {
       await switchCanvas(initial.id);
     } else {
@@ -490,24 +864,39 @@ canvas.addEventListener("mousedown", (e) => {
     // drag ALL selected nodes together. Otherwise drag only the clicked one.
     const useGroup = app.selectedNodeIds.has(hit.id) && app.selectedNodeIds.size > 1;
     const nodeIds = useGroup ? Array.from(app.selectedNodeIds) : [hit.id];
-    const startPositions = new Map<string, { x: number; y: number }>();
-    for (const id of nodeIds) {
-      const n = app.nodes.find((nn) => nn.id === id);
-      if (n) startPositions.set(id, { x: n.x, y: n.y });
-    }
-    const { x: dx0, y: dy0 } = pixelToData(viewport, px, py);
-    drag = {
-      kind: "node",
-      nodeIds,
-      startPositions,
-      startDataX: dx0,
-      startDataY: dy0,
-    };
+    drag = beginNodeDrag(nodeIds, px, py);
     canvas.style.cursor = "grabbing";
   } else {
-    drag = { kind: "viewport" };
+    // No node under the cursor — try a process group. A hit on the group's
+    // border ring or header pill drags every member together. The interior
+    // of the group falls through so overlapping groups stay reachable.
+    const groupHit = hitTestProcessGroup(overlay.ctx, viewport, app.nodes, px, py);
+    if (groupHit) {
+      drag = beginNodeDrag(groupHit.memberIds, px, py);
+      canvas.style.cursor = "grabbing";
+    } else {
+      drag = { kind: "viewport" };
+    }
   }
 });
+
+function beginNodeDrag(
+  nodeIds: string[], px: number, py: number,
+): Extract<DragMode, { kind: "node" }> {
+  const startPositions = new Map<string, { x: number; y: number }>();
+  for (const id of nodeIds) {
+    const n = app.nodes.find((nn) => nn.id === id);
+    if (n) startPositions.set(id, { x: n.x, y: n.y });
+  }
+  const { x: dx0, y: dy0 } = pixelToData(viewport, px, py);
+  return {
+    kind: "node",
+    nodeIds,
+    startPositions,
+    startDataX: dx0,
+    startDataY: dy0,
+  };
+}
 
 window.addEventListener("mouseup", (e) => {
   if (!drag) return;
@@ -631,12 +1020,17 @@ let zoomAccum = 0;
 canvas.addEventListener("wheel", (e) => {
   e.preventDefault();
   zoomAccum += e.deltaY;
+  // zoom() expects (vp, centerX, centerY, factor) with centers in data
+  // space. cursorPx/Py are pixel coords — convert each tick so the zoom
+  // anchors under the cursor as the viewport changes.
   while (zoomAccum > ZOOM_THRESHOLD) {
-    viewport = zoom(viewport, 1 / ZOOM_STEP_FACTOR, cursorPx, cursorPy);
+    const { x: cx, y: cy } = pixelToData(viewport, cursorPx, cursorPy);
+    viewport = zoom(viewport, cx, cy, 1 / ZOOM_STEP_FACTOR);
     zoomAccum -= ZOOM_THRESHOLD;
   }
   while (zoomAccum < -ZOOM_THRESHOLD) {
-    viewport = zoom(viewport, ZOOM_STEP_FACTOR, cursorPx, cursorPy);
+    const { x: cx, y: cy } = pixelToData(viewport, cursorPx, cursorPy);
+    viewport = zoom(viewport, cx, cy, ZOOM_STEP_FACTOR);
     zoomAccum += ZOOM_THRESHOLD;
   }
   requestFrame();
@@ -711,6 +1105,20 @@ async function bootstrap(): Promise<void> {
       }
       if (event.type === "workspace.activated" || event.type === "workspace.resumed") {
         void refreshWorkspaces();
+        return;
+      }
+      if (event.type === "hook.received") {
+        // Global broadcast — fires for CC activity in ANY workspace, even
+        // one this browser isn't currently viewing. The indicator tells
+        // the user which repo CC is actually working in.
+        app.lastCCActivity = {
+          session_id: event.payload.session_id,
+          workspace_id: event.workspace_id,
+          cwd: event.payload.cwd,
+          tool: event.payload.tool,
+          timestamp: event.timestamp,
+        };
+        renderCCActivity();
         return;
       }
     },

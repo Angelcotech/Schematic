@@ -26,7 +26,7 @@ export function initGL(canvas: HTMLCanvasElement): GLContext {
   const gl = canvas.getContext("webgl2", { antialias: true, alpha: false });
   if (!gl) throw new Error("[schematic] WebGL 2 not supported in this browser");
 
-  gl.clearColor(0.04, 0.04, 0.04, 1.0); // near-black background
+  gl.clearColor(0.11, 0.11, 0.11, 1.0); // dark-neutral, gives processes room to stand out
   gl.enable(gl.BLEND);
   gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
 

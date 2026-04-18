@@ -6,9 +6,9 @@
     <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect x='3' y='4' width='10' height='8' rx='1.5' fill='%23d4a93a'/%3E%3Crect x='19' y='4' width='10' height='8' rx='1.5' fill='%23d4a93a'/%3E%3Crect x='11' y='20' width='10' height='8' rx='1.5' fill='%23d4a93a'/%3E%3Cline x1='8' y1='12' x2='16' y2='20' stroke='%23888' stroke-width='1.5'/%3E%3Cline x1='24' y1='12' x2='16' y2='20' stroke='%23888' stroke-width='1.5'/%3E%3C/svg%3E" />
     <title>Schematic</title>
     <style>
-      html, body { margin: 0; padding: 0; height: 100%; overflow: hidden; background: #0a0a0a; color: #ddd; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+      html, body { margin: 0; padding: 0; height: 100%; overflow: hidden; background: #1c1c1c; color: #ddd; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
 
-      #tabbar {
+      #toolbar {
         position: absolute; top: 0; left: 0; right: 0; height: 36px;
         display: flex; align-items: center; gap: 4px;
         padding: 4px 8px; box-sizing: border-box;
@@ -17,24 +17,101 @@
         z-index: 10; user-select: none;
         font-size: 12px;
       }
+      #tabbar { display: flex; align-items: center; gap: 4px; flex: 1; min-width: 0; overflow-x: auto; }
+      #tabbar::-webkit-scrollbar { display: none; }
+      #tools { display: flex; align-items: center; gap: 4px; flex-shrink: 0; }
+
       #tabbar .tab {
-        padding: 4px 10px; border-radius: 4px; cursor: pointer;
+        padding: 4px 4px 4px 10px; border-radius: 4px; cursor: pointer;
         color: rgba(230, 230, 230, 0.7);
         background: rgba(255, 255, 255, 0.04);
+        white-space: nowrap;
+        display: flex; align-items: center; gap: 6px;
       }
       #tabbar .tab:hover { color: #fff; background: rgba(255, 255, 255, 0.08); }
       #tabbar .tab.active {
         background: rgba(212, 169, 58, 0.18);
         color: #fff;
         border: 1px solid rgba(212, 169, 58, 0.4);
-        padding: 3px 9px;
+        padding: 3px 3px 3px 9px;
       }
-      #tabbar .new-canvas {
+      #tabbar .tab .close {
+        width: 14px; height: 14px;
+        display: flex; align-items: center; justify-content: center;
+        border-radius: 3px;
+        color: rgba(230, 230, 230, 0.5);
+        font-size: 14px; line-height: 1;
+      }
+      #tabbar .tab .close:hover { color: #fff; background: rgba(255, 255, 255, 0.12); }
+      #closed-panel {
+        position: absolute; top: 40px; right: 8px; z-index: 20;
+        width: 240px;
+        background: rgba(22, 22, 22, 0.98);
+        border: 1px solid rgba(255, 255, 255, 0.1);
+        border-radius: 6px;
+        padding: 8px 0;
+        font-size: 11px;
+        color: rgba(230, 230, 230, 0.85);
+        box-shadow: 0 8px 24px rgba(0, 0, 0, 0.4);
+      }
+      #closed-panel .empty { padding: 6px 12px; color: rgba(220, 220, 220, 0.5); font-style: italic; }
+      #closed-panel .item {
+        padding: 6px 12px; cursor: pointer;
+        display: flex; align-items: center; justify-content: space-between; gap: 8px;
+      }
+      #closed-panel .item:hover { background: rgba(255, 255, 255, 0.06); }
+      #closed-panel .item .reopen { font-size: 10px; color: rgba(220, 220, 220, 0.5); }
+      #closed-panel .item:hover .reopen { color: #fff; }
+      #tabbar .new-canvas, .tool-btn {
         padding: 4px 10px; border-radius: 4px; cursor: pointer;
         color: rgba(230, 230, 230, 0.5);
         background: rgba(255, 255, 255, 0.03);
+        white-space: nowrap;
       }
-      #tabbar .new-canvas:hover { color: #fff; background: rgba(255, 255, 255, 0.08); }
+      #tabbar .new-canvas:hover, .tool-btn:hover { color: #fff; background: rgba(255, 255, 255, 0.08); }
+      .tool-btn.open { color: #fff; background: rgba(255, 255, 255, 0.12); }
+
+      #cc-activity {
+        display: none;  /* revealed when a session is active */
+        padding: 4px 10px; border-radius: 4px;
+        font-size: 11px; color: rgba(230, 230, 230, 0.7);
+        background: rgba(255, 255, 255, 0.03);
+        border: 1px solid rgba(255, 255, 255, 0.06);
+        display: flex; align-items: center; gap: 7px;
+        white-space: nowrap;
+        cursor: default;
+      }
+      #cc-activity .dot {
+        width: 7px; height: 7px; border-radius: 50%;
+        background: rgba(130, 200, 130, 0.9); /* fresh */
+        box-shadow: 0 0 6px rgba(130, 200, 130, 0.5);
+      }
+      #cc-activity.stale .dot {
+        background: rgba(220, 180, 90, 0.75);
+        box-shadow: none;
+      }
+      #cc-activity.idle .dot {
+        background: rgba(140, 140, 140, 0.6);
+        box-shadow: none;
+      }
+
+      #legend {
+        position: absolute; top: 40px; right: 8px; z-index: 20;
+        width: 240px;
+        background: rgba(22, 22, 22, 0.98);
+        border: 1px solid rgba(255, 255, 255, 0.1);
+        border-radius: 6px;
+        padding: 10px 12px;
+        font-size: 11px;
+        color: rgba(230, 230, 230, 0.85);
+        box-shadow: 0 8px 24px rgba(0, 0, 0, 0.4);
+      }
+      #legend h4 { margin: 0 0 6px 0; font-size: 10px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.04em; color: rgba(220, 220, 220, 0.55); }
+      #legend section + section { margin-top: 12px; }
+      #legend .row { display: flex; align-items: center; gap: 8px; padding: 2px 0; }
+      #legend .swatch { width: 18px; height: 10px; border-radius: 2px; flex-shrink: 0; }
+      #legend .swatch.halo { border-radius: 999px; }
+      #legend .swatch.line { height: 3px; }
 
       #canvas-container {
         position: absolute; top: 36px; left: 0; right: 0; bottom: 0;
@@ -53,16 +130,100 @@
         background: rgba(255, 255, 255, 0.05); padding: 2px 6px; border-radius: 3px;
         font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
       }
+
+      #create-modal {
+        position: absolute; inset: 0; z-index: 30;
+        background: rgba(0, 0, 0, 0.55);
+        display: flex; align-items: center; justify-content: center;
+      }
+      #create-modal .panel {
+        width: 440px; max-width: 90vw;
+        background: #1c1c1c;
+        border: 1px solid rgba(255, 255, 255, 0.12);
+        border-radius: 8px;
+        padding: 20px 22px;
+        box-shadow: 0 12px 36px rgba(0, 0, 0, 0.6);
+      }
+      #create-modal h3 { margin: 0 0 14px 0; font-size: 14px; font-weight: 500; }
+      #create-modal label { display: block; font-size: 11px; color: rgba(220, 220, 220, 0.6); margin-bottom: 14px; }
+      #create-modal input,
+      #create-modal textarea {
+        display: block; width: 100%; margin-top: 4px; box-sizing: border-box;
+        background: rgba(0, 0, 0, 0.3);
+        border: 1px solid rgba(255, 255, 255, 0.1);
+        border-radius: 4px; padding: 7px 9px;
+        color: #eee; font: inherit; font-size: 12px;
+        outline: none;
+        resize: vertical;
+      }
+      #create-modal input:focus, #create-modal textarea:focus {
+        border-color: rgba(212, 169, 58, 0.6);
+      }
+      #create-modal .buttons {
+        display: flex; justify-content: flex-end; gap: 8px; margin-top: 6px;
+      }
+      #create-modal button {
+        border: 1px solid rgba(255, 255, 255, 0.1);
+        background: rgba(255, 255, 255, 0.05);
+        color: #eee; font: inherit; font-size: 12px;
+        padding: 6px 14px; border-radius: 4px; cursor: pointer;
+      }
+      #create-modal button:hover { background: rgba(255, 255, 255, 0.1); }
+      #create-modal button.primary {
+        background: rgba(212, 169, 58, 0.22);
+        border-color: rgba(212, 169, 58, 0.55);
+      }
+      #create-modal button.primary:hover { background: rgba(212, 169, 58, 0.32); }
+      #create-modal button.primary:disabled { opacity: 0.5; cursor: default; }
+
+      #toast {
+        position: absolute; bottom: 16px; left: 50%; transform: translateX(-50%);
+        z-index: 40;
+        background: rgba(22, 22, 22, 0.98);
+        border: 1px solid rgba(212, 169, 58, 0.5);
+        color: #eee; font-size: 12px;
+        padding: 9px 14px; border-radius: 6px;
+        box-shadow: 0 6px 20px rgba(0, 0, 0, 0.4);
+      }
     </style>
   </head>
   <body>
-    <div id="tabbar"></div>
+    <div id="toolbar">
+      <div id="tabbar"></div>
+      <div id="tools">
+        <div id="cc-activity" title=""><span class="dot"></span><span id="cc-activity-text"></span></div>
+        <div class="tool-btn" id="closed-btn" title="Recently closed canvases" style="display:none">Closed</div>
+        <div class="tool-btn" id="legend-btn" title="Show color legend">Legend</div>
+      </div>
+    </div>
     <div id="canvas-container"><canvas id="canvas"></canvas></div>
     <div id="empty-state" style="display:none">
       <h2>No diagrams yet</h2>
       <p>Ask Claude Code to make one.</p>
       <p>Try: <code>diagram the WebGL pipeline</code></p>
     </div>
+    <div id="legend" style="display:none"></div>
+    <div id="closed-panel" style="display:none"></div>
+
+    <div id="create-modal" style="display:none">
+      <div class="panel">
+        <h3>What would you like to map?</h3>
+        <label>
+          Canvas name
+          <input id="create-name" type="text" placeholder="Frontend Pipeline" />
+        </label>
+        <label>
+          What to map
+          <textarea id="create-desc" rows="4" placeholder="e.g. can you map out the front end? I want to see how it connects to engine."></textarea>
+        </label>
+        <div class="buttons">
+          <button id="create-cancel">Cancel</button>
+          <button id="create-submit" class="primary">Create &amp; copy prompt</button>
+        </div>
+      </div>
+    </div>
+
+    <div id="toast" style="display:none"></div>
     <script type="module" src="/src/main.ts"></script>
   </body>
 </html>

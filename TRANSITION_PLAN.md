@@ -148,6 +148,43 @@ Strictly sequential — each stage builds on the last.
 
 ---
 
+### Stage 19 — Schematic as CC reasoning substrate
+
+The canvas isn't just a picture for humans. It's a captured architectural
+structure CC can query to make better code decisions: impact before
+refactors, drift detection, keystone identification, cycle smells. Five
+read-only MCP tools, all returning structured JSON.
+
+**Tools:**
+
+- `trace_impact(file_path)` — for every canvas in the session's workspace
+  that references the file, return node instances + incoming/outgoing
+  edges + summary counts. CC calls this before touching a file to
+  understand blast radius.
+- `audit_canvas(canvas_id)` — check each node's file_path against disk.
+  Report missing files (stale), existing files, duplicates. Minimum
+  viable drift detection; no import parsing in v1.
+- `find_hubs(canvas_id, min_degree?)` — nodes with high in+out edge
+  count. Keystone files that warrant extra care when changed.
+- `find_orphans(canvas_id)` — zero-edge nodes. Forgotten dependencies or
+  dead placeholders.
+- `find_cycles(canvas_id)` — DFS-detected edge cycles, typically a
+  design smell worth surfacing.
+
+**Scope boundaries:**
+
+- All tools resolve workspace via `sessionWorkspace()` (cwd-first).
+- Computations on canvas data already in memory; no new daemon state.
+- Descriptions follow the Stage 18d rules (self-sufficient, no assumed
+  Schematic knowledge).
+- JSON output, not prose.
+
+**Gate:** Fresh CC session, "before you change `http.ts`, run trace_impact
+and tell me what would be affected." CC calls it, reads the JSON,
+summarizes. Same gate for the other four tools.
+
+---
+
 ## Open questions
 
 These should be resolved before Stage 15 code lands — they shape API decisions.

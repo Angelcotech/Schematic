@@ -79,12 +79,25 @@ async function sendOrNull<T>(
   }
 }
 
-// Resolves the workspace whose canvases the canvas-authoring tools operate
-// on. Uses the daemon's persisted focus state (what the browser is showing),
-// not cwd, because the user has explicitly pointed Schematic at a repo by
-// opening it — canvases should land there even if Claude's shell cwd is
-// somewhere else.
-async function focusedWorkspace(): Promise<Workspace | null> {
+// Resolves the workspace the canvas-authoring tools operate on.
+//
+// Prefers the workspace containing the session's cwd — each CC session
+// spawns its own MCP subprocess with its own cwd, so this lets multiple
+// concurrent sessions (one per repo) author canvases in their OWN
+// workspaces without stepping on each other. Sessions A/B/C in repos
+// /A, /B, /C each file their canvases under the right repo.
+//
+// Falls back to the browser's focused workspace only when the session's
+// cwd isn't inside any registered repo — the "user is in ~/tmp and told
+// Claude to make a diagram" case.
+async function sessionWorkspace(): Promise<Workspace | null> {
+  const cwd = process.cwd();
+  const resolved = await fetchOrNull<{ workspace: Workspace | null }>(
+    `/resolve?cwd=${encodeURIComponent(cwd)}`,
+  );
+  if (resolved?.workspace) return resolved.workspace;
+
+  // Fallback: the workspace the browser is currently showing.
   const focus = await fetchOrNull<{ workspace_id: string | null }>("/focus");
   if (!focus?.workspace_id) return null;
   const list = await fetchOrNull<Workspace[]>("/workspaces");
@@ -211,16 +224,17 @@ server.tool(
 
 // ---------------------------------------------------------------------------
 // Canvas authoring. These tools let Claude construct diagrams on behalf of
-// the user. They all operate on the currently-focused workspace — call
-// open_workspace or switch_view first if the user wants a different repo.
+// the user. They resolve the target workspace from Claude's cwd first (so
+// each CC session works inside its own repo), and fall back to whatever
+// the browser has focused if cwd isn't inside a registered repo.
 // ---------------------------------------------------------------------------
 
 const NO_FOCUS_MSG =
-  "No workspace is currently open in Schematic. Ask the user which repo to work on, then call open_workspace before creating a canvas.";
+  "Could not resolve a Schematic workspace. Claude's cwd isn't inside a registered repo and no workspace is open in the browser. Either cd into a repo (with .git or .schematic.json) or call open_workspace first.";
 
 server.tool(
   "create_canvas",
-  `Create a new diagram canvas in the currently-focused workspace. This is the entry point when the user asks you to diagram something.
+  `Create a new diagram canvas in the workspace containing Claude's cwd (the repo you're working in). If the cwd isn't inside a registered repo, falls back to whichever workspace is currently open in the Schematic browser. This is the entry point when the user asks you to diagram something.
 
 Workflow: create_canvas → add_node for each file → add_edge for each relationship. The user sees the canvas live in their browser at localhost:7777.
 
@@ -231,7 +245,7 @@ Coordinate system: canvas-space units, bottom-left origin. Typical canvas is ~20
 Returns the canvas id for subsequent add_node and add_edge calls.`,
   { name: z.string(), description: z.string().optional() },
   async ({ name, description }) => {
-    const ws = await focusedWorkspace();
+    const ws = await sessionWorkspace();
     if (!ws) return daemonDownResponse(NO_FOCUS_MSG);
     const body: { name: string; description?: string } = { name };
     if (description !== undefined) body.description = description;
@@ -257,10 +271,10 @@ Returns the canvas id for subsequent add_node and add_edge calls.`,
 
 server.tool(
   "list_canvases",
-  "List every canvas in the currently-focused workspace. Useful when the user asks you to extend or modify an existing diagram — find it by name here, then use its id for subsequent add_node/add_edge calls.",
+  "List every canvas in the workspace containing Claude's cwd (or the browser's focused workspace if cwd isn't in a registered repo). Useful when the user asks you to extend or modify an existing diagram — find it by name here, then use its id for subsequent add_node/add_edge calls.",
   {},
   async () => {
-    const ws = await focusedWorkspace();
+    const ws = await sessionWorkspace();
     if (!ws) return daemonDownResponse(NO_FOCUS_MSG);
     const list = await fetchOrNull<Canvas[]>(`/workspaces/${ws.id}/canvases`);
     if (list === null) return daemonDownResponse("Failed to list canvases.");
@@ -297,7 +311,7 @@ Returns the node id for subsequent add_edge and move_node calls.`,
     process: z.string().optional(),
   },
   async ({ canvas_id, file_path, x, y, width, height, process: processLabel }) => {
-    const ws = await focusedWorkspace();
+    const ws = await sessionWorkspace();
     if (!ws) return daemonDownResponse(NO_FOCUS_MSG);
     const body: Record<string, unknown> = { file_path };
     if (x !== undefined) body.x = x;
@@ -345,7 +359,7 @@ Guidance: don't mirror every import statement — that clutters. Draw edges that
       .optional(),
   },
   async ({ canvas_id, src, dst, label, kind }) => {
-    const ws = await focusedWorkspace();
+    const ws = await sessionWorkspace();
     if (!ws) return daemonDownResponse(NO_FOCUS_MSG);
     const body: Record<string, unknown> = { src, dst };
     if (label !== undefined) body.label = label;
@@ -371,7 +385,7 @@ server.tool(
   "Reposition a node on its canvas. x and y are bottom-left in canvas-space units (same coordinate system as add_node). Use this to tidy up layout after adding many nodes at once — Schematic auto-grids newly-placed nodes in a simple left-to-right flow, and you (or the user) may want to arrange them by data flow instead.",
   { canvas_id: z.string(), node_id: z.string(), x: z.number(), y: z.number() },
   async ({ canvas_id, node_id, x, y }) => {
-    const ws = await focusedWorkspace();
+    const ws = await sessionWorkspace();
     if (!ws) return daemonDownResponse(NO_FOCUS_MSG);
     const node = await sendOrNull<CanvasNode>(
       "PATCH",
@@ -388,7 +402,7 @@ server.tool(
   "Remove a node from a canvas. Any edges touching the node are deleted too — a dangling edge would be an illegal state.",
   { canvas_id: z.string(), node_id: z.string() },
   async ({ canvas_id, node_id }) => {
-    const ws = await focusedWorkspace();
+    const ws = await sessionWorkspace();
     if (!ws) return daemonDownResponse(NO_FOCUS_MSG);
     const r = await sendOrNull<{ ok: boolean }>(
       "DELETE",
@@ -399,12 +413,129 @@ server.tool(
   },
 );
 
+// ---------------------------------------------------------------------------
+// Structural query tools — read-only introspection so Claude can make
+// architecturally-aware decisions. Each returns structured JSON (not prose)
+// so Claude can reason over the shape without parsing narrative.
+// ---------------------------------------------------------------------------
+
+server.tool(
+  "audit_canvas",
+  `Check a canvas for drift against the filesystem. Walks every node, stats its file_path, reports missing files (stale), existing files, and file_paths that appear on more than one node.
+
+Get the canvas_id from list_canvases first.
+
+When to use: (1) user says "that diagram looks wrong" → audit surfaces stale nodes; (2) before a major refactor → audit so you know what's real; (3) after a reorganization → audit to find what needs updating.
+
+Returns JSON: { canvas_id, canvas_name, missing: [{ node_id, file_path }], existing: [...], duplicates: [{ file_path, node_ids }], summary: { node_count, missing_count, duplicate_file_count } }.
+
+Duplicates are informational, not errors — a file can legitimately appear multiple times on a canvas (playing two roles). Surface them so the user can confirm the intent.`,
+  { canvas_id: z.string() },
+  async ({ canvas_id }) => {
+    const ws = await sessionWorkspace();
+    if (!ws) return daemonDownResponse(NO_FOCUS_MSG);
+    const report = await fetchOrNull<unknown>(
+      `/workspaces/${ws.id}/canvases/${canvas_id}/audit`,
+    );
+    if (report === null) return daemonDownResponse("Failed to audit canvas. Check the canvas_id exists.");
+    return { content: [{ type: "text", text: JSON.stringify(report, null, 2) }] };
+  },
+);
+
+server.tool(
+  "find_hubs",
+  `Identify keystone files on a canvas — nodes with many incoming + outgoing edges. High-degree nodes are risky to refactor because changes cascade widely.
+
+Get the canvas_id from list_canvases first.
+
+Arguments:
+- canvas_id: canvas to analyze.
+- min_degree (optional, default 3): only return nodes with in+out degree >= this.
+
+Returns JSON: { canvas_id, canvas_name, threshold, hubs: [{ node_id, file_path, process?, in_degree, out_degree, total_degree }, ...] } sorted by total_degree descending.
+
+When to use: before proposing a refactor. If the target file is a hub, consider a narrower scope, additional test coverage, or breaking the change into steps.`,
+  { canvas_id: z.string(), min_degree: z.number().optional() },
+  async ({ canvas_id, min_degree }) => {
+    const ws = await sessionWorkspace();
+    if (!ws) return daemonDownResponse(NO_FOCUS_MSG);
+    const qs = min_degree !== undefined ? `?min_degree=${min_degree}` : "";
+    const report = await fetchOrNull<unknown>(
+      `/workspaces/${ws.id}/canvases/${canvas_id}/hubs${qs}`,
+    );
+    if (report === null) return daemonDownResponse("Failed to fetch hubs. Check the canvas_id exists.");
+    return { content: [{ type: "text", text: JSON.stringify(report, null, 2) }] };
+  },
+);
+
+server.tool(
+  "find_orphans",
+  `List nodes with zero edges on a canvas. Orphans are usually either forgotten dependencies (meant to be wired up) or placeholders that never got connected.
+
+Get the canvas_id from list_canvases first.
+
+Returns JSON: { canvas_id, canvas_name, orphans: [{ node_id, file_path, process? }, ...] }.
+
+When to use: canvas cleanup. For each orphan, ask the user whether it should be wired up or removed.`,
+  { canvas_id: z.string() },
+  async ({ canvas_id }) => {
+    const ws = await sessionWorkspace();
+    if (!ws) return daemonDownResponse(NO_FOCUS_MSG);
+    const report = await fetchOrNull<unknown>(
+      `/workspaces/${ws.id}/canvases/${canvas_id}/orphans`,
+    );
+    if (report === null) return daemonDownResponse("Failed to fetch orphans.");
+    return { content: [{ type: "text", text: JSON.stringify(report, null, 2) }] };
+  },
+);
+
+server.tool(
+  "find_cycles",
+  `Detect directed cycles in the canvas's edge graph. Circular dependencies are usually design smells — one of the files should own the relationship and break the cycle.
+
+Get the canvas_id from list_canvases first.
+
+Returns JSON: { canvas_id, canvas_name, cycles: [[{ node_id, file_path }, ...], ...] }. Each inner array is one cycle in traversal order. Empty cycles array = no circular dependencies on this canvas.`,
+  { canvas_id: z.string() },
+  async ({ canvas_id }) => {
+    const ws = await sessionWorkspace();
+    if (!ws) return daemonDownResponse(NO_FOCUS_MSG);
+    const report = await fetchOrNull<unknown>(
+      `/workspaces/${ws.id}/canvases/${canvas_id}/cycles`,
+    );
+    if (report === null) return daemonDownResponse("Failed to fetch cycles.");
+    return { content: [{ type: "text", text: JSON.stringify(report, null, 2) }] };
+  },
+);
+
+server.tool(
+  "trace_impact",
+  `Ask what would be affected before modifying a file. Returns every canvas node referencing the file, with each instance's incoming and outgoing edges resolved to their other endpoint's file_path — so you can reason about blast radius before proposing a refactor.
+
+Arguments:
+- file_path: workspace-relative path, e.g. 'app/src/daemon/http.ts'.
+
+Returns JSON: { file_path, instances: [{ canvas_id, canvas_name, node_id, process?, incoming: [{ other_file_path, label?, kind? }, ...], outgoing: [...] }], summary: { canvas_count, instance_count, incoming_edge_count, outgoing_edge_count, unique_incoming_files, unique_outgoing_files } }.
+
+When to use: at the start of any nontrivial edit — especially on files you're unfamiliar with. Empty instances array = this file isn't mapped on any canvas yet; consider suggesting the user diagram the area before making changes.`,
+  { file_path: z.string() },
+  async ({ file_path }) => {
+    const ws = await sessionWorkspace();
+    if (!ws) return daemonDownResponse(NO_FOCUS_MSG);
+    const report = await fetchOrNull<unknown>(
+      `/workspaces/${ws.id}/impact?file_path=${encodeURIComponent(file_path)}`,
+    );
+    if (report === null) return daemonDownResponse("Failed to fetch impact report.");
+    return { content: [{ type: "text", text: JSON.stringify(report, null, 2) }] };
+  },
+);
+
 server.tool(
   "delete_edge",
   "Remove an edge from a canvas. Use this when a relationship you authored earlier was wrong or is no longer useful.",
   { canvas_id: z.string(), edge_id: z.string() },
   async ({ canvas_id, edge_id }) => {
-    const ws = await focusedWorkspace();
+    const ws = await sessionWorkspace();
     if (!ws) return daemonDownResponse(NO_FOCUS_MSG);
     const r = await sendOrNull<{ ok: boolean }>(
       "DELETE",

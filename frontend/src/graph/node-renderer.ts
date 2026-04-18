@@ -29,7 +29,13 @@ interface GPUMesh {
 const MODULE_FILL = { r: 0.11, g: 0.11, b: 0.11, a: 1.0 };
 const MODULE_BORDER = { r: 0.22, g: 0.22, b: 0.22, a: 1.0 };
 
-const LANGUAGE_FILL: Record<string, { r: number; g: number; b: number }> = {
+// Muted slate for every file node — language is communicated via a thin
+// accent strip on the left side, not the full fill. Demotes nodes visually
+// so processes and edges read as the primary architecture signal.
+const FILE_FILL = { r: 0.20, g: 0.20, b: 0.22, a: 1.0 };
+
+// Language-accent strip colors (4% of node width, left side).
+const LANGUAGE_ACCENT: Record<string, { r: number; g: number; b: number }> = {
   ts: { r: 0.19, g: 0.47, b: 0.78 },
   tsx: { r: 0.19, g: 0.47, b: 0.78 },
   js: { r: 0.90, g: 0.76, b: 0.23 },
@@ -38,7 +44,7 @@ const LANGUAGE_FILL: Record<string, { r: number; g: number; b: number }> = {
   rs: { r: 0.81, g: 0.47, b: 0.29 },
   go: { r: 0.36, g: 0.70, b: 0.83 },
 };
-const DEFAULT_FILL = { r: 0.40, g: 0.40, b: 0.40 };
+const DEFAULT_ACCENT = { r: 0.40, g: 0.40, b: 0.40 };
 
 const HALO_BY_INTENT: Record<AiIntent, { r: number; g: number; b: number; a: number } | null> = {
   idle: null,
@@ -48,6 +54,30 @@ const HALO_BY_INTENT: Record<AiIntent, { r: number; g: number; b: number; a: num
   failed: { r: 0.95, g: 0.55, b: 0.15, a: 0.90 },
   deleted: { r: 0.95, g: 0.25, b: 0.25, a: 0.90 },
 };
+
+// CSS-ready color reference for the legend UI. Re-exports the same RGB
+// values the WebGL shader uses so the legend always matches what you see.
+function rgbCss(c: { r: number; g: number; b: number }): string {
+  return `rgb(${Math.round(c.r * 255)}, ${Math.round(c.g * 255)}, ${Math.round(c.b * 255)})`;
+}
+
+// Legend entries — grouped by shared color (e.g. .ts and .tsx both blue).
+export const LEGEND_LANGUAGES: Array<{ label: string; color: string }> = [
+  { label: ".ts / .tsx",  color: rgbCss(LANGUAGE_ACCENT.ts) },
+  { label: ".js / .jsx",  color: rgbCss(LANGUAGE_ACCENT.js) },
+  { label: ".py",         color: rgbCss(LANGUAGE_ACCENT.py) },
+  { label: ".rs",         color: rgbCss(LANGUAGE_ACCENT.rs) },
+  { label: ".go",         color: rgbCss(LANGUAGE_ACCENT.go) },
+  { label: "other",       color: rgbCss(DEFAULT_ACCENT) },
+];
+
+export const LEGEND_HALO: Array<{ label: string; color: string }> =
+  (Object.entries(HALO_BY_INTENT) as Array<[AiIntent, { r: number; g: number; b: number; a: number } | null]>)
+    .filter(([, c]) => c !== null)
+    .map(([intent, c]) => ({
+      label: intent,
+      color: rgbCss(c as { r: number; g: number; b: number }),
+    }));
 
 const HEALTH_BORDER: Record<Health, { r: number; g: number; b: number; a: number } | null> = {
   ok: null,
@@ -127,11 +157,23 @@ export function buildNodeBuffers(ctx: GLContext, nodes: NodeState[]): NodeBuffer
       });
     }
 
-    // Fill
+    // Fill — main body (uniform slate for file nodes, module fill for modules).
     writeRectTriangles(fillVerts, {
       x: n.x, y: n.y, w: n.width, h: n.height,
       r: fillColor.r, g: fillColor.g, b: fillColor.b, a: fillColor.a,
     });
+
+    // Language accent strip on the left side of file nodes. Thin colored
+    // band keyed to file extension — language read at a glance, without
+    // the node fill dominating the whole visual.
+    if (n.kind === "file") {
+      const accent = n.language ? LANGUAGE_ACCENT[n.language] ?? DEFAULT_ACCENT : DEFAULT_ACCENT;
+      const stripW = Math.max(3, n.width * 0.03);
+      writeRectTriangles(fillVerts, {
+        x: n.x, y: n.y, w: stripW, h: n.height,
+        r: accent.r, g: accent.g, b: accent.b, a: 1.0,
+      });
+    }
 
     // Border: selection wins over health (selection is a loud user signal).
     // Modules with aggregated errors get a red border as a glance signal.
@@ -186,8 +228,6 @@ export function nodeDraws(ctx: GLContext, bufs: NodeBuffers): { vao: WebGLVertex
 function colorForNode(n: NodeState): { r: number; g: number; b: number; a: number } {
   if (n.kind === "module") return { ...MODULE_FILL };
   if (n.kind === "symbol") {
-    // Symbols take a muted tint derived from their kind so the file body
-    // around them still reads as the primary visual unit.
     switch (n.symbol_kind) {
       case "function": return { r: 0.30, g: 0.55, b: 0.45, a: 1.0 };
       case "class": return { r: 0.55, g: 0.40, b: 0.60, a: 1.0 };
@@ -197,8 +237,9 @@ function colorForNode(n: NodeState): { r: number; g: number; b: number; a: numbe
       default: return { r: 0.40, g: 0.40, b: 0.40, a: 1.0 };
     }
   }
-  const palette = n.language ? LANGUAGE_FILL[n.language] ?? DEFAULT_FILL : DEFAULT_FILL;
-  return { r: palette.r, g: palette.g, b: palette.b, a: 1.0 };
+  // File nodes: uniform muted slate. The language is shown as an accent
+  // strip written separately in buildNodeBuffers, not via the fill.
+  return { ...FILE_FILL };
 }
 
 function uploadMesh(ctx: GLContext, verts: Float32Array): GPUMesh {

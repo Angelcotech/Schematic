@@ -37,6 +37,18 @@ const EDGE_COLOR: Record<string, string> = {
 };
 const EDGE_COLOR_FALLBACK = "rgba(170, 175, 185, 0.85)";
 
+// Legend entries — keyed by CanvasEdgeKind (the user-facing vocabulary),
+// mapped through the old legacy Edge kind palette. Exported so the UI
+// legend always matches what drawEdges2D actually paints.
+export const LEGEND_EDGE_KINDS: Array<{ label: string; color: string }> = [
+  { label: "calls",   color: EDGE_COLOR.calls },
+  { label: "imports", color: EDGE_COLOR.import },
+  { label: "reads",   color: EDGE_COLOR.type_only },
+  { label: "writes",  color: EDGE_COLOR.dynamic_import },
+  { label: "control", color: EDGE_COLOR.side_effect },
+  { label: "custom",  color: EDGE_COLOR_FALLBACK },
+];
+
 function boxOf(viewport: ViewportState, n: NodeState): PixelBox {
   // Data coords: n.x,n.y = bottom-left; width/height extend up-right.
   // In pixel space Y is flipped — top of the data rect has the *smaller* py.
@@ -54,43 +66,117 @@ function boxOf(viewport: ViewportState, n: NodeState): PixelBox {
 
 type Pt = { x: number; y: number };
 
-function routeOrthogonal(s: PixelBox, d: PixelBox): Pt[] {
-  const dx = d.cx - s.cx;
-  const dy = d.cy - s.cy;
-  const horizontalDominant = Math.abs(dx) >= Math.abs(dy);
+// Batch route — computes polylines for every edge at once so parallel
+// vertical segments can be spread into lanes. Without this, multiple edges
+// that stair-route between two vertical columns stack their vertical
+// segments at the same X and look like one thick wire.
+//
+// Each edge exits the LEFT or RIGHT side of its source/target (never top
+// or bottom — label pills live there). For stairs, the midX is initially
+// `(exit + enter) / 2`; we then bucket edges by rounded midX and offset
+// each bucket member to its own lane so vertical segments separate.
+//
+// Horizontal edges (exit and enter at the same Y) aren't laned — they
+// naturally line up, which is desirable when they share a source.
+const LANE_BUCKET_PX = 50;
+const LANE_SPACING_PX = 10;
 
-  if (horizontalDominant) {
-    const exitX  = dx >= 0 ? s.right : s.left;
-    const enterX = dx >= 0 ? d.left  : d.right;
-    const startY = s.cy;
-    const endY   = d.cy;
-    if (Math.abs(startY - endY) < 1.5) {
-      return [{ x: exitX, y: startY }, { x: enterX, y: endY }];
+interface EdgePlan {
+  edge: Edge;
+  s: PixelBox;
+  d: PixelBox;
+  exitX: number;
+  enterX: number;
+  exitY: number;
+  enterY: number;
+  baseMidX: number;
+  isStair: boolean;
+}
+
+function planEdge(s: PixelBox, d: PixelBox, edge: Edge): EdgePlan {
+  const goRight = d.cx >= s.cx;
+  const exitX = goRight ? s.right : s.left;
+  const enterX = goRight ? d.left : d.right;
+  const exitY = s.cy;
+  const enterY = d.cy;
+  const isStair = Math.abs(exitY - enterY) >= 1.5;
+  let baseMidX = (exitX + enterX) / 2;
+  const midInsideSrc = baseMidX > s.left - 2 && baseMidX < s.right + 2;
+  const midInsideDst = baseMidX > d.left - 2 && baseMidX < d.right + 2;
+  if (midInsideSrc || midInsideDst) {
+    baseMidX = goRight
+      ? Math.max(s.right, d.right) + 30
+      : Math.min(s.left, d.left) - 30;
+  }
+  return { edge, s, d, exitX, enterX, exitY, enterY, baseMidX, isStair };
+}
+
+function computeRoutes(
+  viewport: ViewportState,
+  edges: Edge[],
+  nodes: NodeState[],
+): Array<{ edge: Edge; pts: Pt[] }> {
+  const byId = new Map<string, NodeState>();
+  for (const n of nodes) byId.set(n.id, n);
+
+  const plans: EdgePlan[] = [];
+  for (const e of edges) {
+    const src = byId.get(e.source);
+    const dst = byId.get(e.target);
+    if (!src || !dst) continue;
+    plans.push(planEdge(boxOf(viewport, src), boxOf(viewport, dst), e));
+  }
+
+  // Bucket stair plans by rounded baseMidX. Within a bucket, sort by
+  // (s.cy, d.cy) for stable ordering, then offset each member's midX by
+  // a per-lane delta. Non-stair (straight horizontal) edges skip laning.
+  const buckets = new Map<number, EdgePlan[]>();
+  for (const p of plans) {
+    if (!p.isStair) continue;
+    const key = Math.round(p.baseMidX / LANE_BUCKET_PX) * LANE_BUCKET_PX;
+    let arr = buckets.get(key);
+    if (!arr) { arr = []; buckets.set(key, arr); }
+    arr.push(p);
+  }
+
+  const finalMidX = new Map<EdgePlan, number>();
+  for (const [, items] of buckets) {
+    items.sort((a, b) => a.s.cy - b.s.cy || a.d.cy - b.d.cy);
+    const n = items.length;
+    if (n === 1) {
+      finalMidX.set(items[0], items[0].baseMidX);
+      continue;
     }
-    const midX = (exitX + enterX) / 2;
-    return [
-      { x: exitX,  y: startY },
-      { x: midX,   y: startY },
-      { x: midX,   y: endY   },
-      { x: enterX, y: endY   },
-    ];
+    // Centered spread around the bucket's base midX.
+    const base = items.reduce((sum, p) => sum + p.baseMidX, 0) / n;
+    const totalSpread = (n - 1) * LANE_SPACING_PX;
+    const start = base - totalSpread / 2;
+    for (let i = 0; i < n; i++) {
+      finalMidX.set(items[i], start + i * LANE_SPACING_PX);
+    }
   }
 
-  // Vertical dominant. On screen, "below target" means larger py.
-  const exitY  = dy >= 0 ? s.bottom : s.top;
-  const enterY = dy >= 0 ? d.top    : d.bottom;
-  const startX = s.cx;
-  const endX   = d.cx;
-  if (Math.abs(startX - endX) < 1.5) {
-    return [{ x: startX, y: exitY }, { x: endX, y: enterY }];
+  const routes: Array<{ edge: Edge; pts: Pt[] }> = [];
+  for (const p of plans) {
+    if (!p.isStair) {
+      routes.push({
+        edge: p.edge,
+        pts: [{ x: p.exitX, y: p.exitY }, { x: p.enterX, y: p.enterY }],
+      });
+      continue;
+    }
+    const midX = finalMidX.get(p) ?? p.baseMidX;
+    routes.push({
+      edge: p.edge,
+      pts: [
+        { x: p.exitX, y: p.exitY },
+        { x: midX, y: p.exitY },
+        { x: midX, y: p.enterY },
+        { x: p.enterX, y: p.enterY },
+      ],
+    });
   }
-  const midY = (exitY + enterY) / 2;
-  return [
-    { x: startX, y: exitY  },
-    { x: startX, y: midY   },
-    { x: endX,   y: midY   },
-    { x: endX,   y: enterY },
-  ];
+  return routes;
 }
 
 function strokeForEdge(edge: Edge): number {
@@ -100,6 +186,29 @@ function strokeForEdge(edge: Edge): number {
   const w = edge.weight ?? 1;
   if (w <= 1) return 1.5;
   return Math.min(5, 1.5 + Math.log2(w) * 0.8);
+}
+
+// Strokes a polyline where every interior corner is replaced with a
+// quadrant arc of up to `maxRadius`. The effective radius is clamped to
+// half the shorter adjacent segment so short edges don't over-curve.
+function drawRoundedPolyline(
+  c2d: CanvasRenderingContext2D,
+  pts: Pt[],
+  maxRadius: number,
+): void {
+  c2d.beginPath();
+  c2d.moveTo(pts[0].x, pts[0].y);
+  for (let i = 1; i < pts.length - 1; i++) {
+    const prev = pts[i - 1];
+    const here = pts[i];
+    const next = pts[i + 1];
+    const inLen  = Math.hypot(here.x - prev.x, here.y - prev.y);
+    const outLen = Math.hypot(next.x - here.x, next.y - here.y);
+    const r = Math.min(maxRadius, inLen / 2, outLen / 2);
+    c2d.arcTo(here.x, here.y, next.x, next.y, r);
+  }
+  c2d.lineTo(pts[pts.length - 1].x, pts[pts.length - 1].y);
+  c2d.stroke();
 }
 
 function drawArrowhead(
@@ -140,32 +249,20 @@ export function drawEdges2D(
   nodes: NodeState[],
 ): void {
   if (edges.length === 0) return;
-  const byId = new Map<string, NodeState>();
-  for (const n of nodes) byId.set(n.id, n);
 
   c2d.save();
   c2d.lineCap = "round";
   c2d.lineJoin = "round";
 
-  for (const e of edges) {
-    const src = byId.get(e.source);
-    const dst = byId.get(e.target);
-    if (!src || !dst) continue; // edge references invalid node; skip rather than throw
-
-    const s = boxOf(viewport, src);
-    const d = boxOf(viewport, dst);
-    const pts = routeOrthogonal(s, d);
+  for (const { edge, pts } of computeRoutes(viewport, edges, nodes)) {
     if (pts.length < 2) continue;
 
-    const color = EDGE_COLOR[e.kind] ?? EDGE_COLOR_FALLBACK;
-    const width = strokeForEdge(e);
+    const color = EDGE_COLOR[edge.kind] ?? EDGE_COLOR_FALLBACK;
+    const width = strokeForEdge(edge);
 
     c2d.strokeStyle = color;
     c2d.lineWidth = width;
-    c2d.beginPath();
-    c2d.moveTo(pts[0].x, pts[0].y);
-    for (let i = 1; i < pts.length; i++) c2d.lineTo(pts[i].x, pts[i].y);
-    c2d.stroke();
+    drawRoundedPolyline(c2d, pts, 8);
 
     const tip  = pts[pts.length - 1];
     const prev = pts[pts.length - 2];
@@ -189,21 +286,17 @@ export function hitTestEdge(
   thresholdPx = 6,
 ): Edge | null {
   if (edges.length === 0) return null;
-  const byId = new Map<string, NodeState>();
-  for (const n of nodes) byId.set(n.id, n);
 
   let best: Edge | null = null;
   let bestDist = thresholdPx;
-  for (const e of edges) {
-    const src = byId.get(e.source);
-    const dst = byId.get(e.target);
-    if (!src || !dst) continue;
-    const pts = routeOrthogonal(boxOf(viewport, src), boxOf(viewport, dst));
+  // Use the same lane-aware routes that drawEdges2D draws, so hit targets
+  // match what the user sees.
+  for (const { edge, pts } of computeRoutes(viewport, edges, nodes)) {
     for (let i = 0; i < pts.length - 1; i++) {
       const d = pointSegmentDistance(pixelX, pixelY, pts[i], pts[i + 1]);
       if (d < bestDist) {
         bestDist = d;
-        best = e;
+        best = edge;
       }
     }
   }

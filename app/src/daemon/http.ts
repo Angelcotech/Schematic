@@ -168,6 +168,62 @@ export function createRequestHandler(
         return json(res, 200, store.listCanvases());
       }
 
+      // GET /workspaces/:wid/impact?file_path=... — blast-radius query
+      // for Claude: aggregate every canvas node referencing this file,
+      // with their edges resolved back to the other endpoint's file_path.
+      const impactMatch = /^\/workspaces\/([^/]+)\/impact$/.exec(path);
+      if (method === "GET" && impactMatch) {
+        const wid = impactMatch[1];
+        if (!ctx.registry.get(wid)) return err(res, 404, "unknown workspace");
+        const filePath = parsed.searchParams.get("file_path");
+        if (!filePath) return err(res, 400, "missing query param: file_path");
+        const store = await ctx.canvasStores.getOrLoad(wid);
+        return json(res, 200, store.impactForFile(filePath));
+      }
+
+      // GET /workspaces/:wid/canvases/:cid/audit — canvas-vs-disk drift.
+      const auditMatch = /^\/workspaces\/([^/]+)\/canvases\/([^/]+)\/audit$/.exec(path);
+      if (method === "GET" && auditMatch) {
+        const wid = auditMatch[1];
+        const cid = auditMatch[2];
+        const workspace = ctx.registry.get(wid);
+        if (!workspace) return err(res, 404, "unknown workspace");
+        const store = await ctx.canvasStores.getOrLoad(wid);
+        return json(res, 200, await store.auditCanvas(cid, workspace.root));
+      }
+
+      // GET /workspaces/:wid/canvases/:cid/hubs?min_degree=N — high-degree nodes.
+      const hubsMatch = /^\/workspaces\/([^/]+)\/canvases\/([^/]+)\/hubs$/.exec(path);
+      if (method === "GET" && hubsMatch) {
+        const wid = hubsMatch[1];
+        const cid = hubsMatch[2];
+        if (!ctx.registry.get(wid)) return err(res, 404, "unknown workspace");
+        const minDegreeParam = parsed.searchParams.get("min_degree");
+        const minDegree = minDegreeParam ? Math.max(0, parseInt(minDegreeParam, 10) || 0) : 3;
+        const store = await ctx.canvasStores.getOrLoad(wid);
+        return json(res, 200, store.findHubs(cid, minDegree));
+      }
+
+      // GET /workspaces/:wid/canvases/:cid/orphans — zero-edge nodes.
+      const orphansMatch = /^\/workspaces\/([^/]+)\/canvases\/([^/]+)\/orphans$/.exec(path);
+      if (method === "GET" && orphansMatch) {
+        const wid = orphansMatch[1];
+        const cid = orphansMatch[2];
+        if (!ctx.registry.get(wid)) return err(res, 404, "unknown workspace");
+        const store = await ctx.canvasStores.getOrLoad(wid);
+        return json(res, 200, store.findOrphans(cid));
+      }
+
+      // GET /workspaces/:wid/canvases/:cid/cycles — directed cycles.
+      const cyclesMatch = /^\/workspaces\/([^/]+)\/canvases\/([^/]+)\/cycles$/.exec(path);
+      if (method === "GET" && cyclesMatch) {
+        const wid = cyclesMatch[1];
+        const cid = cyclesMatch[2];
+        if (!ctx.registry.get(wid)) return err(res, 404, "unknown workspace");
+        const store = await ctx.canvasStores.getOrLoad(wid);
+        return json(res, 200, store.findCycles(cid));
+      }
+
       // POST /workspaces/:wid/canvases  { name, description? }
       if (method === "POST" && canvasListMatch) {
         const wid = canvasListMatch[1];
@@ -198,7 +254,7 @@ export function createRequestHandler(
         return json(res, 200, store.getCanvas(cid));
       }
 
-      // PATCH /workspaces/:wid/canvases/:cid  { name?, description? }
+      // PATCH /workspaces/:wid/canvases/:cid  { name?, description?, hidden? }
       if (method === "PATCH" && canvasIdMatch) {
         const wid = canvasIdMatch[1];
         const cid = canvasIdMatch[2];
@@ -206,6 +262,7 @@ export function createRequestHandler(
         const body = JSON.parse(await readBody(req)) as {
           name?: string;
           description?: string;
+          hidden?: boolean;
         };
         const store = await ctx.canvasStores.getOrLoad(wid);
         const canvas = await store.updateCanvas(cid, body);
@@ -365,8 +422,14 @@ export function createRequestHandler(
         const normalized = normalizeHook(ccPayload);
         const result = await handleHook(ctx, normalized);
         if (normalized.event === "UserPromptSubmit") {
+          // Claude Code requires hookEventName inside hookSpecificOutput —
+          // without it the payload fails schema validation and the hook is
+          // reported as an error on every user prompt.
           return json(res, 200, {
-            hookSpecificOutput: { additionalContext: result.additionalContext ?? "" },
+            hookSpecificOutput: {
+              hookEventName: "UserPromptSubmit",
+              additionalContext: result.additionalContext ?? "",
+            },
           });
         }
         return json(res, 200, {});
@@ -476,9 +539,11 @@ async function handleHook(ctx: DaemonContext, payload: HookPayload): Promise<Hoo
   if (workspace.state !== "active") return {};
 
   await ctx.registry.touch(workspace.id);
+  // Broadcast hook.received with no workspace scope so the browser can
+  // surface CC-session activity regardless of which workspace it's
+  // currently viewing. Volume is low (one per CC tool call).
   ctx.ws.broadcast(
     { type: "hook.received", workspace_id: workspace.id, payload, timestamp: Date.now() },
-    workspace.id,
   );
 
   const activityStore = ctx.fileActivity.getOrCreate(workspace.id);
