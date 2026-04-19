@@ -24,9 +24,15 @@ async function daemonUrl(path: string): Promise<string> {
   return `http://127.0.0.1:${cfg.port}${path}`;
 }
 
+// Every daemon request from MCP carries this header. The daemon's write
+// guard accepts it as proof the request came from Schematic's own MCP
+// server, not from ad-hoc curl/CC-falling-back-to-bash — the latter gets
+// a 403 stop-sign instead of being allowed to create zombie state.
+const MCP_CLIENT_HEADER = { "X-Schematic-Client": "mcp" } as const;
+
 async function fetchOrNull<T>(path: string): Promise<T | null> {
   try {
-    const r = await fetch(await daemonUrl(path));
+    const r = await fetch(await daemonUrl(path), { headers: MCP_CLIENT_HEADER });
     if (!r.ok) return null;
     return (await r.json()) as T;
   } catch (e) {
@@ -59,10 +65,10 @@ async function sendOrNull<T>(
 ): Promise<T | null> {
   try {
     const init: RequestInit = { method };
-    if (body !== undefined) {
-      init.headers = { "Content-Type": "application/json" };
-      init.body = JSON.stringify(body);
-    }
+    init.headers = body !== undefined
+      ? { "Content-Type": "application/json", ...MCP_CLIENT_HEADER }
+      : { ...MCP_CLIENT_HEADER };
+    if (body !== undefined) init.body = JSON.stringify(body);
     const r = await fetch(await daemonUrl(path), init);
     if (!r.ok) return null;
     if (r.status === 204) return {} as T;
@@ -236,7 +242,7 @@ server.tool(
   "create_canvas",
   `Create a new diagram canvas in the workspace containing Claude's cwd (the repo you're working in). If the cwd isn't inside a registered repo, falls back to whichever workspace is currently open in the Schematic browser. This is the entry point when the user asks you to diagram something.
 
-Workflow: create_canvas → add_node for each file → add_edge for each relationship. The user sees the canvas live in their browser at localhost:7777.
+Workflow: create_canvas → bulk_populate with ALL nodes and edges in one call. The user sees the canvas live in their browser at localhost:7777. Do NOT call add_node / add_edge in a loop to build a canvas from scratch — use bulk_populate.
 
 Naming: scope canvases tightly. Prefer "WebGL Pipeline", "Auth Flow", "G1 Engine" over "Full Architecture". Focused diagrams are readable; kitchen-sink diagrams aren't. If the user asks for "the whole repo", consider creating several canvases for different concerns instead.
 
@@ -374,6 +380,69 @@ Guidance: don't mirror every import statement — that clutters. Draw edges that
         {
           type: "text",
           text: JSON.stringify({ edge_id: edge.id }, null, 2),
+        },
+      ],
+    };
+  },
+);
+
+server.tool(
+  "bulk_populate",
+  `Populate a canvas with many nodes and edges in a single call. **Use this when building a canvas from scratch** — it's the right tool for the "diagram X" workflow. Avoid calling add_node / add_edge in a loop; one bulk_populate replaces 40+ individual tool calls.
+
+Arguments:
+- canvas_id: target canvas, from create_canvas.
+- nodes: array of { client_id, file_path, x?, y?, width?, height?, process? }
+    client_id is any short string you invent (e.g. "n1", "n2") to reference this node from the edges array in the same call. File_path is the workspace-relative path.
+- edges: array of { src, dst, label?, kind? }
+    src and dst are either a client_id from the nodes array above OR the real id of an existing node (for additive population after the canvas is partially built). kind is one of calls | imports | reads | writes | control | custom.
+
+Validation is all-or-nothing. If any edge references an unknown src/dst, the whole call aborts with no partial state written.
+
+Returns: { nodes_created, edges_created }. Node real ids are not returned — for subsequent edits (move_node, delete_node), fetch the canvas with list_canvases + get or pass another bulk_populate with additive intent.
+
+Layout rule still applies: give each node an (x, y) so data flows left-to-right or top-to-bottom; use process labels to group related files.`,
+  {
+    canvas_id: z.string(),
+    nodes: z.array(
+      z.object({
+        client_id: z.string(),
+        file_path: z.string(),
+        x: z.number().optional(),
+        y: z.number().optional(),
+        width: z.number().optional(),
+        height: z.number().optional(),
+        process: z.string().optional(),
+      }),
+    ),
+    edges: z.array(
+      z.object({
+        src: z.string(),
+        dst: z.string(),
+        label: z.string().optional(),
+        kind: z
+          .enum(["calls", "imports", "reads", "writes", "control", "custom"])
+          .optional(),
+      }),
+    ),
+  },
+  async ({ canvas_id, nodes, edges }) => {
+    const ws = await sessionWorkspace();
+    if (!ws) return daemonDownResponse(NO_FOCUS_MSG);
+    const result = await postOrNull<{ nodes_created: number; edges_created: number }>(
+      `/workspaces/${ws.id}/canvases/${canvas_id}/bulk`,
+      { nodes, edges },
+    );
+    if (!result) {
+      return daemonDownResponse(
+        "bulk_populate failed. Check canvas_id exists and all edge src/dst reference either a client_id in this call or a real existing node id.",
+      );
+    }
+    return {
+      content: [
+        {
+          type: "text",
+          text: JSON.stringify(result, null, 2),
         },
       ],
     };

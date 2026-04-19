@@ -476,14 +476,20 @@ function renderTabs(): void {
     });
     tabbarEl.appendChild(chip);
   }
-  const add = document.createElement("div");
-  add.className = "new-canvas";
-  add.textContent = "+ new";
-  add.title = "Create a new canvas";
-  add.addEventListener("click", () => {
-    void createCanvasPrompt();
-  });
-  tabbarEl.appendChild(add);
+  // + new only makes sense when a workspace is focused — without one,
+  // there's no workspace to create a canvas in, so hide the chip. The
+  // welcome panel's "Open a repo folder manually" button handles the
+  // "get into a workspace" path instead.
+  if (app.activeWorkspaceId) {
+    const add = document.createElement("div");
+    add.className = "new-canvas";
+    add.textContent = "+ new";
+    add.title = "Create a new canvas";
+    add.addEventListener("click", () => {
+      void createCanvasPrompt();
+    });
+    tabbarEl.appendChild(add);
+  }
 
   // Toggle the "Closed" button based on whether there's anything to reopen.
   const hiddenCount = hiddenCanvases().length;
@@ -560,6 +566,24 @@ function updateEmptyState(): void {
   }
   emptyStatePanelEl.innerHTML = renderEmptyStateHTML(mode);
   emptyStateEl.style.display = "flex";
+  // Mockup diagram appears only in onboarding modes. In authoring mode
+  // CC is about to paint real nodes, so showing a fake diagram behind
+  // them would be confusing.
+  const mockupEl = document.getElementById("mockup-bg") as SVGElement | null;
+  if (mockupEl) {
+    const showMockup = mode.kind === "no-workspace" || mode.kind === "no-canvases";
+    mockupEl.style.display = showMockup ? "block" : "none";
+  }
+  // If the panel has an inline "Create blank canvas" button (no-canvases
+  // mode), wire it directly — avoids sending the user to hunt for the
+  // smaller `+ new` chip in the tab bar.
+  const welcomeNewBtn = document.getElementById("welcome-new-canvas");
+  if (welcomeNewBtn) {
+    welcomeNewBtn.addEventListener("click", () => {
+      emptyStateEl.style.display = "none";
+      createCanvasPrompt();
+    });
+  }
 }
 
 type EmptyStateMode =
@@ -610,14 +634,27 @@ function shortenTarget(_act: { cwd: string }, _root?: string): string | undefine
   return undefined;
 }
 
+const WHAT_IS_SCHEMATIC = `
+  <p class="what-is">
+    Schematic is a drafting canvas for your codebase. Claude reads the code,
+    places files as boxes, and connects them with labeled wires showing how
+    they relate. Each canvas is a focused view — one subsystem at a time,
+    authored by Claude, edited live as you work.
+  </p>
+`;
+
 function renderEmptyStateHTML(mode: EmptyStateMode): string {
   if (mode.kind === "no-workspace") {
     return `
       <h1>Schematic</h1>
       <p class="tagline">Claude Code draws architecture diagrams of your repo.</p>
+      ${WHAT_IS_SCHEMATIC}
       <div class="step">
         <div class="step-num">1</div>
-        <div class="step-body">Open Claude Code in your repo's folder.</div>
+        <div class="step-body">
+          Open a <strong>new</strong> Claude Code session in your repo's folder.
+          <div class="note">Already-open sessions can't use Schematic until restarted — MCP tools load at session start.</div>
+        </div>
       </div>
       <div class="step">
         <div class="step-num">2</div>
@@ -625,7 +662,7 @@ function renderEmptyStateHTML(mode: EmptyStateMode): string {
       </div>
       <div class="step">
         <div class="step-num">3</div>
-        <div class="step-body">Say: <code>diagram the architecture</code> — or right-click anything once a canvas exists to copy smarter prompts.</div>
+        <div class="step-body">Say: <code>diagram the architecture</code></div>
       </div>
     `;
   }
@@ -633,14 +670,19 @@ function renderEmptyStateHTML(mode: EmptyStateMode): string {
     return `
       <h1>${escapeHtml(mode.workspaceName)}</h1>
       <p class="tagline">Workspace is open — no diagrams yet.</p>
+      ${WHAT_IS_SCHEMATIC}
       <div class="step">
         <div class="step-num">→</div>
-        <div class="step-body">In Claude Code, say something like <code>diagram the auth flow</code> or <code>map how the frontend connects to the engine</code>.</div>
+        <div class="step-body">
+          In a Claude Code session, say something like
+          <code>diagram the auth flow</code> or
+          <code>map how the frontend connects to the engine</code>.
+          <div class="note">If Claude says it doesn't have Schematic tools, restart the session.</div>
+        </div>
       </div>
-      <div class="step">
-        <div class="step-num">+</div>
-        <div class="step-body">Or click <code>+ new</code> at the top to start a blank canvas and populate it manually.</div>
-      </div>
+      <button class="welcome-action" id="welcome-new-canvas">
+        + Create blank canvas
+      </button>
     `;
   }
   // authoring
@@ -668,9 +710,12 @@ let legendOpen = false;
 function renderLegend(): void {
   const edgeRows = LEGEND_EDGE_KINDS
     .map((e) => `
-      <div class="row">
+      <div class="row edge-row">
         <span class="swatch line" style="background:${e.color}"></span>
-        <span>${e.label}</span>
+        <div class="edge-row-text">
+          <span class="edge-label">${e.label}</span>
+          <span class="edge-hint">${e.hint}</span>
+        </div>
       </div>`)
     .join("");
   const langRows = LEGEND_LANGUAGES
@@ -1234,17 +1279,42 @@ async function runFindCycles(wid: string, cid: string, cname: string): Promise<v
   await copyPromptAndToast(prompt, "Cycles prompt copied.");
 }
 
-// --- Shared: copy + toast ----------------------------------------------
+// --- Shared: prompt modal ----------------------------------------------
+// Every prompt-copy action lands here. Single deterministic path: the
+// prompt opens in a modal with the text pre-selected and a Copy button
+// that calls clipboard. No silent clipboard write, no try/catch branch
+// — the user always sees the same thing regardless of browser clipboard
+// behavior, and they can always select-copy manually if Copy fails.
+
+const promptModalEl = document.getElementById("prompt-modal") as HTMLDivElement | null;
+const promptModalText = document.getElementById("prompt-modal-text") as HTMLTextAreaElement | null;
+const promptModalCopy = document.getElementById("prompt-modal-copy") as HTMLButtonElement | null;
+const promptModalClose = document.getElementById("prompt-modal-close") as HTMLButtonElement | null;
 
 async function copyPromptAndToast(prompt: string, label: string): Promise<void> {
-  try {
-    await navigator.clipboard.writeText(prompt);
-    showToast(`${label} Paste into Claude Code.`);
-  } catch {
-    showToast("Clipboard blocked; prompt logged to console.");
-    console.log("[schematic] prompt:\n" + prompt);
-  }
+  if (!promptModalEl || !promptModalText) return;
+  promptModalText.value = prompt;
+  promptModalEl.dataset.label = label;
+  promptModalEl.style.display = "flex";
+  promptModalText.focus();
+  promptModalText.select();
 }
+
+promptModalCopy?.addEventListener("click", async () => {
+  if (!promptModalText) return;
+  await navigator.clipboard.writeText(promptModalText.value);
+  const label = promptModalEl?.dataset.label ?? "Prompt copied.";
+  if (promptModalEl) promptModalEl.style.display = "none";
+  showToast(`${label} Paste into Claude Code.`);
+});
+promptModalClose?.addEventListener("click", () => {
+  if (promptModalEl) promptModalEl.style.display = "none";
+});
+promptModalEl?.addEventListener("click", (e) => {
+  if (e.target === promptModalEl && promptModalEl) {
+    promptModalEl.style.display = "none";
+  }
+});
 
 // Creates a new canvas on the server, builds a prompt referencing it,
 // copies to clipboard, and switches the view to it. Prompts use the
@@ -1421,9 +1491,13 @@ async function reloadWorkspaceScope(workspaceId: string | null): Promise<void> {
 
   if (workspaceId) {
     app.canvases = await fetchJSON<Canvas[]>(`/workspaces/${workspaceId}/canvases`);
-    // Start on the first VISIBLE canvas — hidden ones are waiting in the
-    // Closed menu.
-    const initial = visibleCanvases()[0];
+    // Pick the most-recently-updated visible canvas as the initial. Tab
+    // order stays in creation order for stability, but on refresh the
+    // user lands on what they were last working on — not the first tab.
+    // Hidden canvases live in the Closed menu and are excluded.
+    const initial = [...visibleCanvases()].sort(
+      (a, b) => (b.updated_at ?? 0) - (a.updated_at ?? 0),
+    )[0];
     if (initial) {
       await switchCanvas(initial.id);
     } else {
@@ -1730,15 +1804,25 @@ canvas.addEventListener("wheel", (e) => {
 async function bootstrap(): Promise<void> {
   app.workspaces = await fetchJSON<Workspace[]>("/workspaces");
 
-  // Precedence: ?w=<id> URL param, then daemon /focus, then first active.
-  const urlParam = new URLSearchParams(window.location.search).get("w");
-  const focusResp = urlParam ? null : await fetchJSON<{ workspace_id: string | null }>("/focus").catch(() => null);
+  // `?welcome` forces the onboarding view regardless of what the daemon
+  // has focused. Useful for demos, screenshots, and verifying the empty
+  // state without pausing workspaces server-side.
+  const params = new URLSearchParams(window.location.search);
+  const forceWelcome = params.has("welcome");
+
+  // Precedence: ?welcome (force no-workspace), then ?w=<id>, then daemon
+  // /focus, then first active.
+  const urlParam = params.get("w");
+  const focusResp = forceWelcome || urlParam
+    ? null
+    : await fetchJSON<{ workspace_id: string | null }>("/focus").catch(() => null);
   const focused = focusResp?.workspace_id ?? null;
-  const chosen =
-    (urlParam && app.workspaces.find((w) => w.id === urlParam)) ??
-    (focused && app.workspaces.find((w) => w.id === focused)) ??
-    app.workspaces.find((w) => w.state === "active") ??
-    null;
+  const chosen = forceWelcome
+    ? null
+    : (urlParam && app.workspaces.find((w) => w.id === urlParam)) ??
+      (focused && app.workspaces.find((w) => w.id === focused)) ??
+      app.workspaces.find((w) => w.state === "active") ??
+      null;
 
   await reloadWorkspaceScope(chosen ? chosen.id : null);
 

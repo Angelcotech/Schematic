@@ -57,6 +57,45 @@ export function createRequestHandler(
       const parsed = new URL(url, "http://localhost");
       const path = parsed.pathname;
 
+      // Write guard. Schematic without MCP is the illusion of working —
+      // CC falls back to bash+curl, trips over response-shape divergence,
+      // and leaves half-built canvases. Rather than normalize shapes
+      // (which would bless CC-uses-HTTP as a supported path), we forbid
+      // it outright. Three provenance channels can write state:
+      //   - browser frontend: same-origin Origin header
+      //   - Schematic MCP server: X-Schematic-Client: mcp
+      //   - Schematic CLI (`schematic open`, pause, forget, etc.):
+      //     X-Schematic-Client: cli
+      // Everyone else gets a 403 stop-sign with next steps.
+      //
+      // Allowlisted writes (no header needed):
+      //   /shutdown — called by `schematic stop`, no guard friction
+      //   /hook     — CC hook bridge, driven by settings.json hooks
+      const isWrite = method === "POST" || method === "PATCH" || method === "DELETE";
+      const writeIsAllowlisted = path === "/shutdown" || path === "/hook";
+      if (isWrite && !writeIsAllowlisted) {
+        const clientHeader = req.headers["x-schematic-client"];
+        const isTaggedClient = clientHeader === "mcp" || clientHeader === "cli";
+        const origin = (req.headers["origin"] as string | undefined) ?? "";
+        // Daemon binds loopback, so any localhost origin is same-machine.
+        // Allow any port so Vite dev (its own port) proxies through.
+        const isBrowser = /^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/.test(origin);
+        if (!isTaggedClient && !isBrowser) {
+          return err(
+            res,
+            403,
+            [
+              "Schematic rejects direct HTTP writes.",
+              "Use the Schematic MCP tools (create_canvas, add_node, add_edge).",
+              "If they aren't available in your Claude Code session:",
+              "  1. Run `npx claude-schematic install` in a terminal",
+              "  2. Start a NEW Claude Code session — MCP servers only load at startup",
+              "  3. Retry; the schematic MCP server will be registered",
+            ].join("\n"),
+          );
+        }
+      }
+
       if (method === "GET" && path === "/status") {
         return json(res, 200, {
           ok: true,
@@ -286,6 +325,83 @@ export function createRequestHandler(
           wid,
         );
         return json(res, 200, { ok: true });
+      }
+
+      // POST /workspaces/:wid/canvases/:cid/bulk
+      // Single-shot population: create many nodes + edges in one call.
+      // Edges reference nodes by caller-supplied client_id (any string).
+      // Avoids the 40-call hailstorm when CC authors a canvas from
+      // scratch — one tool call, one TUI repaint.
+      const bulkMatch =
+        /^\/workspaces\/([^/]+)\/canvases\/([^/]+)\/bulk$/.exec(path);
+      if (method === "POST" && bulkMatch) {
+        const wid = bulkMatch[1];
+        const cid = bulkMatch[2];
+        if (!ctx.registry.get(wid)) return err(res, 404, "unknown workspace");
+        const body = JSON.parse(await readBody(req)) as {
+          nodes?: Array<{
+            client_id?: string;
+            file_path?: string;
+            x?: number;
+            y?: number;
+            width?: number;
+            height?: number;
+            process?: string;
+          }>;
+          edges?: Array<{
+            src?: string;
+            dst?: string;
+            label?: string;
+            kind?: CanvasEdgeKind;
+          }>;
+        };
+        const nodes = body.nodes ?? [];
+        const edges = body.edges ?? [];
+        // Validate — client_id and file_path required per node; src/dst
+        // required per edge. Fail the whole call on any malformed entry;
+        // no partial state.
+        for (let i = 0; i < nodes.length; i++) {
+          const n = nodes[i];
+          if (typeof n.client_id !== "string" || n.client_id.length === 0) {
+            return err(res, 400, `nodes[${i}]: missing or empty client_id`);
+          }
+          if (typeof n.file_path !== "string" || n.file_path.length === 0) {
+            return err(res, 400, `nodes[${i}]: missing or empty file_path`);
+          }
+        }
+        for (let i = 0; i < edges.length; i++) {
+          const e = edges[i];
+          if (typeof e.src !== "string" || e.src.length === 0) {
+            return err(res, 400, `edges[${i}]: missing src`);
+          }
+          if (typeof e.dst !== "string" || e.dst.length === 0) {
+            return err(res, 400, `edges[${i}]: missing dst`);
+          }
+        }
+        const store = await ctx.canvasStores.getOrLoad(wid);
+        try {
+          const result = await store.bulkPopulate(cid, {
+            nodes: nodes.map((n) => ({
+              client_id: n.client_id!,
+              file_path: n.file_path!,
+              ...(n.x !== undefined ? { x: n.x } : {}),
+              ...(n.y !== undefined ? { y: n.y } : {}),
+              ...(n.width !== undefined ? { width: n.width } : {}),
+              ...(n.height !== undefined ? { height: n.height } : {}),
+              ...(n.process !== undefined ? { process: n.process } : {}),
+            })),
+            edges: edges.map((e) => ({
+              src: e.src!,
+              dst: e.dst!,
+              ...(e.label !== undefined ? { label: e.label } : {}),
+              ...(e.kind !== undefined ? { kind: e.kind } : {}),
+            })),
+          });
+          broadcastContentChanged(ctx, wid, cid);
+          return json(res, 201, result);
+        } catch (e) {
+          return err(res, 400, (e as Error).message);
+        }
       }
 
       // POST /workspaces/:wid/canvases/:cid/nodes  — add node.
@@ -546,6 +662,15 @@ interface HookResult {
 async function handleHook(ctx: DaemonContext, payload: HookPayload): Promise<HookResult> {
   ctx.state.eventCount++;
 
+  // Prime CC to use the Schematic MCP tools when the user asks for a
+  // visual diagram. Without this, CC defaults to writing a markdown
+  // "schematic" doc — especially in repos that already have SCHEMATIC.md
+  // / ARCHITECTURE.md files, where the word is grounded to docs, not to
+  // live canvases. The prime fires independent of workspace routing:
+  // users ask "diagram the X repo" from a home dir cwd all the time, and
+  // the hook must work there too.
+  const schematicPrime = buildSchematicPrime(payload);
+
   // Resolve from the most specific path this hook carries. A target file
   // path is more precise than the session's cwd — it IS the exact file on
   // disk the tool is about to touch, so it unambiguously belongs to
@@ -570,8 +695,12 @@ async function handleHook(ctx: DaemonContext, payload: HookPayload): Promise<Hoo
     );
   }
 
-  if (!workspace) return {};
-  if (workspace.state !== "active") return {};
+  if (!workspace) {
+    return schematicPrime ? { additionalContext: schematicPrime } : {};
+  }
+  if (workspace.state !== "active") {
+    return schematicPrime ? { additionalContext: schematicPrime } : {};
+  }
 
   await ctx.registry.touch(workspace.id);
   // Broadcast hook.received with no workspace scope so the browser can
@@ -596,15 +725,40 @@ async function handleHook(ctx: DaemonContext, payload: HookPayload): Promise<Hoo
     );
   }
 
-  // UserPromptSubmit returns additionalContext. In canvas mode we don't
-  // auto-inject a graph summary — CC authors canvases on demand. Keeping
-  // the handler arm in case we later want to surface "here are the
-  // canvases in this workspace" as context.
   if (payload.event === "UserPromptSubmit") {
-    return { additionalContext: "" };
+    return schematicPrime ? { additionalContext: schematicPrime } : {};
   }
 
   return {};
+}
+
+// Scan a UserPromptSubmit payload for keywords that indicate the user
+// wants a visual diagram, and return a short prime telling CC to use
+// Schematic's MCP tools instead of writing a markdown doc. Returns null
+// if no keyword hits — we don't want to add context to every prompt.
+function buildSchematicPrime(payload: HookPayload): string | null {
+  if (payload.event !== "UserPromptSubmit") return null;
+  const prompt = (payload.prompt ?? "").toLowerCase();
+  if (prompt.length === 0) return null;
+  // Keywords that should almost always mean "use Schematic." Tight list
+  // — false positives (e.g. word "map" in unrelated contexts) would spam
+  // every prompt with unwanted context.
+  const triggers = [
+    "schematic", "diagram", "visualize", "visualise",
+    "architecture map", "architecture diagram", "arch diagram",
+    "draw the", "map out", "map the", "blueprint",
+  ];
+  const hit = triggers.some((t) => prompt.includes(t));
+  if (!hit) return null;
+  return [
+    "[Schematic prime] The Schematic MCP server is registered in this session.",
+    "When the user asks for a schematic, diagram, or architecture map, use the Schematic MCP tools to build a live canvas — NOT a markdown file.",
+    "Load the tools first: ToolSearch with query \"schematic\". That surfaces create_canvas, bulk_populate, list_canvases, add_node, add_edge, move_node, delete_node, trace_impact, audit_canvas, find_hubs, find_orphans, find_cycles.",
+    "Workflow for new canvases: create_canvas → bulk_populate with all nodes + edges in ONE call. Do NOT call add_node / add_edge in a loop — that's 40+ tool calls and is the wrong tool for initial population.",
+    "Use add_node / add_edge only for incremental edits after the canvas exists.",
+    "The canvas renders live at http://localhost:7777.",
+    "Do not author a .md file named SCHEMATIC/ARCHITECTURE/DIAGRAM unless the user explicitly asks for markdown.",
+  ].join("\n");
 }
 
 // --- tiny response helpers ---

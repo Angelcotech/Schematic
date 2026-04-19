@@ -120,7 +120,7 @@
 
       #legend {
         position: absolute; top: 40px; right: 8px; z-index: 20;
-        width: 240px;
+        width: 300px;
         background: rgba(14, 22, 34, 0.98);
         border: 1px solid rgba(255, 255, 255, 0.1);
         border-radius: 6px;
@@ -135,6 +135,22 @@
       #legend .swatch { width: 18px; height: 10px; border-radius: 2px; flex-shrink: 0; }
       #legend .swatch.halo { border-radius: 999px; }
       #legend .swatch.line { height: 3px; }
+
+      /* Two-line rows for edge kinds: label on top, short hint below.
+         The hint teaches the vocabulary ("what IS a call edge") without
+         forcing users to go hunt for docs. */
+      #legend .edge-row { align-items: flex-start; padding: 5px 0; }
+      #legend .edge-row .swatch.line { margin-top: 7px; }
+      #legend .edge-row-text {
+        display: flex; flex-direction: column; gap: 2px; min-width: 0;
+      }
+      #legend .edge-label {
+        font-size: 11px; color: rgba(230, 240, 250, 0.95); font-weight: 500;
+      }
+      #legend .edge-hint {
+        font-size: 10.5px; line-height: 1.35;
+        color: rgba(180, 200, 230, 0.65);
+      }
       #legend .attribution {
         margin-top: 14px; padding-top: 10px;
         border-top: 1px solid rgba(140, 200, 235, 0.12);
@@ -157,15 +173,77 @@
         display: flex; align-items: center; justify-content: center;
         pointer-events: none;
       }
+      /* Mockup diagram that sits behind the welcome panel. Slight radial
+         fade at the center keeps the panel readable — the mockup is more
+         visible at the canvas edges, drawing the eye outward after the
+         user reads the welcome text. */
+      #mockup-bg {
+        position: absolute; inset: 0;
+        width: 100%; height: 100%;
+        opacity: 0.32;
+        pointer-events: none;
+        -webkit-mask-image:
+          radial-gradient(ellipse 58% 52% at center, transparent 0%, transparent 28%, rgba(0,0,0,0.55) 55%, rgba(0,0,0,1) 80%);
+        mask-image:
+          radial-gradient(ellipse 58% 52% at center, transparent 0%, transparent 28%, rgba(0,0,0,0.55) 55%, rgba(0,0,0,1) 80%);
+      }
+      #mockup-bg .process rect {
+        fill: rgba(94, 192, 229, 0.035);
+        stroke: rgba(94, 192, 229, 0.28);
+        stroke-width: 1;
+        stroke-dasharray: 4 4;
+      }
+      #mockup-bg .process-pill {
+        fill: rgba(10, 22, 36, 0.85);
+        stroke: rgba(94, 192, 229, 0.45);
+        stroke-width: 1;
+        stroke-dasharray: 0;
+      }
+      #mockup-bg .process-label {
+        font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+        font-size: 12px;
+        fill: rgba(200, 230, 250, 0.85);
+        text-anchor: middle;
+        letter-spacing: 0.05em;
+      }
+      #mockup-bg .node rect {
+        fill: rgba(14, 28, 46, 0.9);
+        stroke: rgba(94, 192, 229, 0.6);
+        stroke-width: 1.2;
+      }
+      #mockup-bg .node text {
+        font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+        font-size: 13px;
+        fill: rgba(220, 235, 250, 0.92);
+        text-anchor: middle;
+      }
+      #mockup-bg path {
+        fill: none;
+        stroke-width: 1.5;
+      }
+      #mockup-bg .e-calls    { stroke: rgb(94, 192, 229); }
+      #mockup-bg .e-imports  { stroke: rgb(150, 180, 210); }
+      #mockup-bg .e-reads    { stroke: rgb(130, 200, 140); }
+      #mockup-bg .e-writes   { stroke: rgb(230, 170, 100); }
+      #mockup-bg .e-control  { stroke: rgb(190, 150, 220); stroke-dasharray: 4 3; }
+      #mockup-bg .edge-label {
+        font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+        font-size: 11px;
+        fill: rgba(200, 220, 240, 0.85);
+        text-anchor: middle;
+      }
       #empty-state .panel {
         pointer-events: auto;
+        position: relative;
+        z-index: 1;
         max-width: 420px;
-        background: rgba(18, 30, 46, 0.85);
-        border: 1px solid rgba(140, 200, 235, 0.15);
+        background: rgba(18, 30, 46, 0.92);
+        border: 1px solid rgba(140, 200, 235, 0.22);
         border-radius: 10px;
         padding: 28px 32px;
         color: rgba(230, 240, 250, 0.95);
-        box-shadow: 0 10px 30px rgba(0, 0, 0, 0.35);
+        box-shadow: 0 10px 30px rgba(0, 0, 0, 0.45);
+        backdrop-filter: blur(2px);
       }
       #empty-state h1 {
         font-size: 22px; font-weight: 500; margin: 0 0 4px 0;
@@ -191,19 +269,56 @@
         margin-top: 1px;
       }
       #empty-state .step-body { flex: 1; color: rgba(230, 240, 250, 0.90); }
+      #empty-state .step-body .note {
+        margin-top: 4px;
+        font-size: 11px;
+        color: rgba(180, 200, 230, 0.55);
+        font-style: italic;
+      }
       #empty-state code {
         background: rgba(94, 192, 229, 0.10);
         border: 1px solid rgba(94, 192, 229, 0.20);
         color: rgba(190, 225, 245, 0.98);
-        padding: 2px 7px; border-radius: 4px;
+        padding: 1px 6px; border-radius: 4px;
         font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
         font-size: 12px;
+        /* Inline (not inline-block) keeps the code chip on the same
+           baseline as surrounding text — no vertical offset against
+           labels like "Say:". white-space: nowrap still prevents wrap
+           mid-phrase. */
+        white-space: nowrap;
+      }
+      #empty-state .what-is {
+        font-size: 12px;
+        line-height: 1.55;
+        color: rgba(210, 225, 240, 0.78);
+        margin: 0 0 18px 0;
+        padding: 12px 14px;
+        background: rgba(94, 192, 229, 0.05);
+        border-left: 2px solid rgba(94, 192, 229, 0.35);
+        border-radius: 0 4px 4px 0;
       }
       #empty-state .authoring {
         display: flex; align-items: center; gap: 10px;
         margin-top: 14px; padding-top: 14px;
         border-top: 1px solid rgba(140, 200, 235, 0.12);
         font-size: 12px; color: rgba(200, 215, 230, 0.75);
+      }
+      #empty-state .welcome-action {
+        display: block;
+        margin-top: 18px;
+        padding: 10px 16px;
+        width: 100%;
+        background: rgba(94, 192, 229, 0.18);
+        border: 1px solid rgba(94, 192, 229, 0.5);
+        border-radius: 6px;
+        color: rgba(230, 240, 250, 0.95);
+        font: inherit;
+        font-size: 13px;
+        cursor: pointer;
+      }
+      #empty-state .welcome-action:hover {
+        background: rgba(94, 192, 229, 0.28);
       }
       #empty-state .authoring .dot {
         width: 8px; height: 8px; border-radius: 50%;
@@ -274,6 +389,51 @@
       #create-modal button.primary:hover { background: rgba(94, 192, 229, 0.35); }
       #create-modal button.primary:disabled { opacity: 0.5; cursor: default; }
 
+      /* The one-and-only prompt modal. Every context-menu action that
+         produces a CC prompt opens this — user reviews, clicks Copy, and
+         pastes into Claude Code. */
+      #prompt-modal {
+        position: absolute; inset: 0; z-index: 30;
+        background: rgba(0, 0, 0, 0.55);
+        display: flex; align-items: center; justify-content: center;
+      }
+      #prompt-modal .panel {
+        width: 560px; max-width: 92vw;
+        background: #0a141f;
+        border: 1px solid rgba(140, 200, 235, 0.18);
+        border-radius: 8px;
+        padding: 20px 22px;
+        box-shadow: 0 12px 36px rgba(0, 0, 0, 0.6);
+      }
+      #prompt-modal h3 { margin: 0 0 8px 0; font-size: 14px; font-weight: 500; }
+      #prompt-modal .hint { font-size: 11px; color: rgba(200, 215, 230, 0.6); margin: 0 0 12px 0; }
+      #prompt-modal textarea {
+        display: block; width: 100%; min-height: 220px; box-sizing: border-box;
+        background: rgba(0, 0, 0, 0.3);
+        border: 1px solid rgba(94, 192, 229, 0.30);
+        border-radius: 4px; padding: 10px 12px;
+        color: #dce7f0;
+        font: inherit; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11px;
+        line-height: 1.5;
+        resize: vertical;
+        outline: none;
+      }
+      #prompt-modal textarea:focus { border-color: rgba(94, 192, 229, 0.65); }
+      #prompt-modal .buttons { margin-top: 10px; display: flex; justify-content: flex-end; gap: 8px; }
+      #prompt-modal button {
+        font: inherit; font-size: 12px;
+        padding: 6px 14px; border-radius: 4px; cursor: pointer;
+        border: 1px solid rgba(255, 255, 255, 0.1);
+        background: rgba(255, 255, 255, 0.05);
+        color: #eee;
+      }
+      #prompt-modal button:hover { background: rgba(255, 255, 255, 0.1); }
+      #prompt-modal button.primary {
+        border-color: rgba(94, 192, 229, 0.55);
+        background: rgba(94, 192, 229, 0.20);
+      }
+      #prompt-modal button.primary:hover { background: rgba(94, 192, 229, 0.35); }
+
       #toast {
         position: absolute; bottom: 16px; left: 50%; transform: translateX(-50%);
         z-index: 40;
@@ -327,6 +487,106 @@
     </div>
     <div id="canvas-container"><canvas id="canvas"></canvas></div>
     <div id="empty-state" style="display:none">
+      <!-- Atmospheric mockup diagram. Shown only on onboarding modes
+           (no-workspace, no-canvases) to tease what Schematic produces.
+           Hidden in authoring mode so it doesn't sit behind real live
+           nodes when CC starts populating the canvas. -->
+      <svg id="mockup-bg" viewBox="0 0 1400 780" preserveAspectRatio="xMidYMid slice" aria-hidden="true">
+        <defs>
+          <!-- One arrowhead per edge color. Marker path is a triangle
+               pointing right along +x; orient="auto" rotates per-edge. -->
+          <marker id="mk-calls" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto">
+            <path d="M0,0 L10,5 L0,10 z" fill="rgb(94, 192, 229)"/>
+          </marker>
+          <marker id="mk-imports" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto">
+            <path d="M0,0 L10,5 L0,10 z" fill="rgb(150, 180, 210)"/>
+          </marker>
+          <marker id="mk-reads" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto">
+            <path d="M0,0 L10,5 L0,10 z" fill="rgb(130, 200, 140)"/>
+          </marker>
+          <marker id="mk-writes" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto">
+            <path d="M0,0 L10,5 L0,10 z" fill="rgb(230, 170, 100)"/>
+          </marker>
+          <marker id="mk-control" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto">
+            <path d="M0,0 L10,5 L0,10 z" fill="rgb(190, 150, 220)"/>
+          </marker>
+        </defs>
+
+        <!-- Process pills (rounded outlines with pilled title). -->
+        <g class="process">
+          <rect x="50" y="80" width="400" height="280" rx="10"/>
+          <rect class="process-pill" x="60" y="64" width="130" height="22" rx="11"/>
+          <text class="process-label" x="125" y="79">Frontend</text>
+        </g>
+        <g class="process">
+          <rect x="560" y="120" width="420" height="420" rx="10"/>
+          <rect class="process-pill" x="570" y="104" width="120" height="22" rx="11"/>
+          <text class="process-label" x="630" y="119">Daemon</text>
+        </g>
+        <g class="process">
+          <rect x="1080" y="80" width="280" height="320" rx="10"/>
+          <rect class="process-pill" x="1090" y="64" width="90" height="22" rx="11"/>
+          <text class="process-label" x="1135" y="79">MCP</text>
+        </g>
+
+        <!-- Edges. Orthogonal polylines with small rounded corners,
+             matching the real renderer's routing style. Drawn BEFORE
+             nodes so nodes paint on top. -->
+
+        <!-- api.ts → http.ts: calls (cyan). Right-out, up, right-in. -->
+        <path class="e-calls" d="M390,240 L470,240 Q476,240 476,234 L476,226 Q476,220 482,220 L598,220" marker-end="url(#mk-calls)"/>
+        <text class="edge-label" x="478" y="212">fetch</text>
+
+        <!-- http.ts → store.ts (horizontal). -->
+        <path class="e-reads" d="M730,220 L798,220" marker-end="url(#mk-reads)"/>
+
+        <!-- http.ts → watcher.ts (vertical straight down). -->
+        <path class="e-control" d="M660,236 L660,330" marker-end="url(#mk-control)"/>
+        <text class="edge-label" x="684" y="286">triggers</text>
+
+        <!-- watcher.ts → broadcaster.ts (horizontal). -->
+        <path class="e-writes" d="M730,350 L798,350" marker-end="url(#mk-writes)"/>
+
+        <!-- store.ts → persist.json. Down, left, down. -->
+        <path class="e-writes" d="M880,236 L880,414 Q880,420 874,420 L776,420 Q770,420 770,426 L770,460" marker-end="url(#mk-writes)"/>
+        <text class="edge-label" x="830" y="412">persists</text>
+
+        <!-- broadcaster.ts → main.ts: long return loop.
+             Down, left, up, right-ish to main.ts top. -->
+        <path class="e-calls" d="M880,366 L880,614 Q880,620 874,620 L156,620 Q150,620 150,614 L150,156" marker-end="url(#mk-calls)"/>
+        <text class="edge-label" x="500" y="612">ws broadcast</text>
+
+        <!-- tools.ts → http.ts (horizontal across MCP→Daemon gap). -->
+        <path class="e-calls" d="M1150,238 L978,238 Q970,238 970,230 L970,228 Q970,220 962,220 L730,220" marker-end="url(#mk-calls)"/>
+
+        <!-- server.ts → tools.ts (vertical). -->
+        <path class="e-imports" d="M1220,156 L1220,208" marker-end="url(#mk-imports)"/>
+
+        <!-- main.ts → canvas.ts (horizontal). -->
+        <path class="e-imports" d="M220,138 L238,138" marker-end="url(#mk-imports)"/>
+
+        <!-- main.ts → renderer.ts (vertical). -->
+        <path class="e-calls" d="M150,156 L150,208" marker-end="url(#mk-calls)"/>
+
+        <!-- canvas.ts → renderer.ts. Down, left, down. -->
+        <path class="e-reads" d="M320,156 L320,184 Q320,190 314,190 L226,190 Q220,190 220,196 L220,208" marker-end="url(#mk-reads)"/>
+
+        <!-- Nodes. File-path pill boxes with filename. -->
+        <g class="node"><rect x="80"   y="120" width="140" height="36" rx="5"/><text x="150" y="143">main.ts</text></g>
+        <g class="node"><rect x="250"  y="120" width="140" height="36" rx="5"/><text x="320" y="143">canvas.ts</text></g>
+        <g class="node"><rect x="80"   y="220" width="140" height="36" rx="5"/><text x="150" y="243">renderer.ts</text></g>
+        <g class="node"><rect x="250"  y="220" width="140" height="36" rx="5"/><text x="320" y="243">api.ts</text></g>
+
+        <g class="node"><rect x="590"  y="200" width="140" height="36" rx="5"/><text x="660" y="223">http.ts</text></g>
+        <g class="node"><rect x="810"  y="200" width="140" height="36" rx="5"/><text x="880" y="223">store.ts</text></g>
+        <g class="node"><rect x="590"  y="330" width="140" height="36" rx="5"/><text x="660" y="353">watcher.ts</text></g>
+        <g class="node"><rect x="810"  y="330" width="140" height="36" rx="5"/><text x="880" y="353">broadcaster.ts</text></g>
+        <g class="node"><rect x="700"  y="460" width="140" height="36" rx="5"/><text x="770" y="483">persist.json</text></g>
+
+        <g class="node"><rect x="1150" y="120" width="140" height="36" rx="5"/><text x="1220" y="143">server.ts</text></g>
+        <g class="node"><rect x="1150" y="220" width="140" height="36" rx="5"/><text x="1220" y="243">tools.ts</text></g>
+        <g class="node"><rect x="1150" y="320" width="140" height="36" rx="5"/><text x="1220" y="343">schema.ts</text></g>
+      </svg>
       <div class="panel" id="empty-state-panel"></div>
     </div>
     <div id="brand-footer">
@@ -355,6 +615,18 @@
 
     <div id="toast" style="display:none"></div>
     <div id="ctx-menu" style="display:none"></div>
+
+    <div id="prompt-modal" style="display:none">
+      <div class="panel">
+        <h3>Paste this into Claude Code</h3>
+        <p class="hint">Click Copy, then paste into an open Claude Code session. You can also select and copy manually.</p>
+        <textarea id="prompt-modal-text" readonly></textarea>
+        <div class="buttons">
+          <button id="prompt-modal-close">Close</button>
+          <button id="prompt-modal-copy" class="primary">Copy</button>
+        </div>
+      </div>
+    </div>
     <script type="module" src="/src/main.ts"></script>
   </body>
 </html>

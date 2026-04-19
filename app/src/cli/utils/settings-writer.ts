@@ -9,14 +9,26 @@
 // CC actually reads. settings.json.mcpServers was ignored in practice —
 // that's why users saw "tools not in deferred list" on fresh installs.
 
-import { execFile } from "node:child_process";
+import { exec } from "node:child_process";
 import { readFile, mkdir } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join, dirname } from "node:path";
 import { promisify } from "node:util";
 import { atomicWrite } from "../../daemon/persist/atomic-write.js";
 
-const execFileAsync = promisify(execFile);
+// Shell-based exec, not execFile. execFile against `claude` (a Bun-compiled
+// Mach-O binary on macOS) intermittently fails with ENOEXEC or ENOENT when
+// called from this CLI subprocess — the parent shell handles the binary
+// fine, but Node's direct exec path doesn't. Routing through `sh -c` lets
+// the shell resolve PATH and handle binary exec the same way the user's
+// interactive shell does.
+const execAsync = promisify(exec);
+
+// Escape a single arg for safe inclusion in a `sh -c` command line. Wraps
+// the value in single quotes and escapes any embedded single quotes.
+function shEscape(s: string): string {
+  return `'${s.replace(/'/g, "'\\''")}'`;
+}
 
 const CLAUDE_SETTINGS = join(homedir(), ".claude", "settings.json");
 const SCHEMATIC_ID = "schematic";
@@ -36,8 +48,19 @@ type HookMatcher = {
 interface ClaudeSettings {
   hooks?: Record<string, HookMatcher[]>;
   mcpServers?: Record<string, { command: string; args?: string[]; env?: Record<string, string> }>;
+  permissions?: {
+    allow?: string[];
+    deny?: string[];
+    ask?: string[];
+  };
   [k: string]: unknown;
 }
+
+// Pattern that allows every Schematic MCP tool without prompting. Canvas
+// authoring needs 30+ tool calls per diagram — manual approval for each
+// would make the tool unusable. Users still see tool-use UI in CC, just
+// without the "allow/deny" modal per call.
+const SCHEMATIC_PERMISSION = "mcp__schematic__*";
 
 async function readSettings(): Promise<ClaudeSettings> {
   try {
@@ -79,6 +102,19 @@ function stripSchematic(settings: ClaudeSettings): ClaudeSettings {
     delete settings.mcpServers[SCHEMATIC_ID];
     if (Object.keys(settings.mcpServers).length === 0) delete settings.mcpServers;
   }
+  if (settings.permissions?.allow) {
+    settings.permissions.allow = settings.permissions.allow.filter(
+      (p) => p !== SCHEMATIC_PERMISSION,
+    );
+    if (settings.permissions.allow.length === 0) delete settings.permissions.allow;
+    if (
+      !settings.permissions.allow &&
+      !settings.permissions.deny?.length &&
+      !settings.permissions.ask?.length
+    ) {
+      delete settings.permissions;
+    }
+  }
   return settings;
 }
 
@@ -113,6 +149,16 @@ export async function installSchematicEntries(paths: InstallPaths): Promise<Inst
     });
     settings.hooks[event] = existing;
   }
+
+  // --- Permissions: pre-approve the Schematic MCP tool namespace so CC
+  // doesn't modal-prompt on every add_node / add_edge call. A single
+  // canvas needs 30+ tool calls; approval fatigue would kill the UX.
+  settings.permissions ??= {};
+  settings.permissions.allow ??= [];
+  if (!settings.permissions.allow.includes(SCHEMATIC_PERMISSION)) {
+    settings.permissions.allow.push(SCHEMATIC_PERMISSION);
+  }
+
   await writeSettings(settings);
 
   // --- MCP: register via the Claude Code CLI. ---
@@ -120,19 +166,11 @@ export async function installSchematicEntries(paths: InstallPaths): Promise<Inst
   // CC's internal store (~/.claude.json). Writing to settings.json
   // doesn't work in practice — CC ignores that field for MCP.
   try {
-    // Pass env explicitly — Node's execFile can miss PATH inheritance in
-    // some install contexts (npm-global install, detached subprocesses),
-    // which would make `claude` look unresolvable even when it's on PATH.
     const execOpts = { env: process.env };
+    const serverPath = shEscape(paths.mcpServerPath);
     // `remove` is idempotent-ish: fails if not present, so swallow.
-    await execFileAsync("claude", ["mcp", "remove", "-s", "user", SCHEMATIC_ID], execOpts).catch(() => {});
-    await execFileAsync("claude", [
-      "mcp", "add",
-      "-s", "user",
-      SCHEMATIC_ID,
-      "node",
-      paths.mcpServerPath,
-    ], execOpts);
+    await execAsync(`claude mcp remove -s user ${SCHEMATIC_ID}`, execOpts).catch(() => {});
+    await execAsync(`claude mcp add -s user ${SCHEMATIC_ID} node ${serverPath}`, execOpts);
   } catch (e) {
     // Most common cause: `claude` CLI not on PATH, or CC version without
     // the mcp subcommand. Tell the user how to finish manually rather
@@ -155,8 +193,8 @@ export async function uninstallSchematicEntries(): Promise<void> {
   // Remove MCP registration from CC's store. Swallow errors — the entry
   // may not be present (uninstall from a partial install) or the CLI
   // may be unavailable; neither should block cleanup.
-  await execFileAsync(
-    "claude", ["mcp", "remove", "-s", "user", SCHEMATIC_ID],
+  await execAsync(
+    `claude mcp remove -s user ${SCHEMATIC_ID}`,
     { env: process.env },
   ).catch(() => {});
 }

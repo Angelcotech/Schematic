@@ -11,7 +11,9 @@ npm install -g claude-schematic
 schematic install
 ```
 
-That writes three Claude Code hooks to `~/.claude/settings.json`, registers an MCP server via `claude mcp add`, starts the daemon on `localhost:7777`, and opens the dashboard in your browser. If port 7777 is busy, it auto-picks the next free port up to 7800.
+That writes three Claude Code hooks to `~/.claude/settings.json`, registers an MCP server via `claude mcp add`, pre-authorizes the Schematic MCP tool namespace so you don't get prompted on every node/edge call, starts the daemon on `localhost:7777`, and opens the dashboard in your browser. If port 7777 is busy, it auto-picks the next free port up to 7800.
+
+After install, **start a new Claude Code session** — hooks and MCP registrations only load at session start.
 
 ## Use
 
@@ -29,15 +31,19 @@ In the browser, **right-click** anything:
 
 Every right-click action runs the query, packs the result into a Claude-ready prompt, and copies it to your clipboard. Paste into Claude and hit send.
 
+> **Tip:** visit `localhost:7777/?welcome` to see the onboarding screen regardless of session state — useful for demos and screenshots.
+
 ## What Claude can do
 
-Thirteen MCP tools ship in the box:
+Fourteen MCP tools ship in the box:
 
 **Workspace management:** `open_workspace`, `list_workspaces`, `switch_view`, `pause_workspace`.
 
-**Canvas authoring:** `create_canvas`, `list_canvases`, `add_node`, `add_edge`, `move_node`, `delete_node`, `delete_edge`.
+**Canvas authoring:** `create_canvas`, `bulk_populate`, `list_canvases`, `add_node`, `add_edge`, `move_node`, `delete_node`, `delete_edge`.
 
 **Structural queries:** `trace_impact` (blast radius before refactors), `audit_canvas` (drift vs disk), `find_hubs` (high-degree keystones), `find_orphans` (zero-edge nodes), `find_cycles` (circular dependencies).
+
+`bulk_populate` is the intended path for building a canvas from scratch — one call takes the whole node + edge set and lands the canvas atomically. Use `add_node` / `add_edge` only for incremental edits.
 
 All five structural-query tools return JSON, so Claude can reason over the shape instead of parsing prose.
 

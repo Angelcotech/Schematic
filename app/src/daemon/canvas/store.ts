@@ -135,8 +135,18 @@ export class CanvasStore {
     const ids = await listCanvasIds(workspaceId);
     const files = new Map<string, CanvasFile>();
     for (const id of ids) {
-      const file = await readCanvasFile(workspaceId, id);
-      files.set(file.canvas.id, file);
+      try {
+        const file = await readCanvasFile(workspaceId, id);
+        files.set(file.canvas.id, file);
+      } catch (e) {
+        // One bad canvas file (corrupt JSON, partial write, mismatched
+        // id) must NOT brick the whole workspace. Log and skip — every
+        // other canvas stays operational. The corrupt file is still on
+        // disk; the user can inspect/repair/delete it manually.
+        console.error(
+          `[schematic] skipping corrupt canvas ${id} in workspace ${workspaceId}: ${(e as Error).message}`,
+        );
+      }
     }
     return new CanvasStore(workspaceId, files);
   }
@@ -450,6 +460,100 @@ export class CanvasStore {
     file.canvas.updated_at = Date.now();
     await writeCanvasFile(this.workspaceId, file);
     return node;
+  }
+
+  // Single-shot population: create N nodes + M edges in one transaction,
+  // one file write, one updated_at bump. Replaces the 40-call hailstorm
+  // CC otherwise produces when authoring a canvas from scratch. Edges
+  // reference nodes by the caller-supplied `client_id` (an arbitrary
+  // handle like "n1"); we resolve each client_id to the node's real
+  // server-assigned UUID before validating and persisting edges.
+  //
+  // Validation is all-or-nothing: a single bad edge (unknown src/dst)
+  // aborts the whole call before anything is written. No partial state.
+  async bulkPopulate(
+    canvasId: string,
+    input: {
+      nodes: Array<{
+        client_id: string;
+        file_path: string;
+        x?: number;
+        y?: number;
+        width?: number;
+        height?: number;
+        process?: string;
+      }>;
+      edges: Array<{
+        src: string; // client_id
+        dst: string; // client_id
+        label?: string;
+        kind?: CanvasEdgeKind;
+      }>;
+    },
+  ): Promise<{ nodes_created: number; edges_created: number }> {
+    const file = this.getCanvas(canvasId);
+
+    const clientIdToRealId = new Map<string, string>();
+    const createdNodes: CanvasNode[] = [];
+    const baseIndex = file.nodes.length;
+
+    // Pass 1: build the node objects and resolve client_id → real UUID.
+    // Duplicate client_ids within the same bulk call are a bug — fail loud.
+    for (let i = 0; i < input.nodes.length; i++) {
+      const n = input.nodes[i];
+      if (clientIdToRealId.has(n.client_id)) {
+        throw new Error(`duplicate client_id in bulk payload: "${n.client_id}"`);
+      }
+      const pos =
+        n.x !== undefined && n.y !== undefined
+          ? { x: n.x, y: n.y }
+          : autoGridPosition(baseIndex + i);
+      const realId = randomUUID();
+      clientIdToRealId.set(n.client_id, realId);
+      createdNodes.push({
+        id: realId,
+        canvas_id: canvasId,
+        file_path: n.file_path,
+        x: pos.x,
+        y: pos.y,
+        width: n.width ?? AUTO_NODE_W,
+        height: n.height ?? AUTO_NODE_H,
+        ...(n.process !== undefined ? { process: n.process } : {}),
+      });
+    }
+
+    // Pass 2: resolve and validate all edges before touching state.
+    // Edges may reference either a client_id from this bulk call OR an
+    // existing node's real id (for additive bulk-populate after a canvas
+    // is partially built). Unknown id → abort.
+    const createdEdges: CanvasEdge[] = [];
+    for (const e of input.edges) {
+      const srcId = clientIdToRealId.get(e.src) ??
+        (file.nodes.some((n) => n.id === e.src) ? e.src : null);
+      const dstId = clientIdToRealId.get(e.dst) ??
+        (file.nodes.some((n) => n.id === e.dst) ? e.dst : null);
+      if (!srcId) throw new Error(`unknown src node id/client_id: "${e.src}"`);
+      if (!dstId) throw new Error(`unknown dst node id/client_id: "${e.dst}"`);
+      createdEdges.push({
+        id: randomUUID(),
+        canvas_id: canvasId,
+        src: srcId,
+        dst: dstId,
+        ...(e.label !== undefined ? { label: e.label } : {}),
+        ...(e.kind !== undefined ? { kind: e.kind } : {}),
+      });
+    }
+
+    // Commit atomically: all nodes, then all edges, one file write.
+    file.nodes.push(...createdNodes);
+    file.edges.push(...createdEdges);
+    file.canvas.updated_at = Date.now();
+    await writeCanvasFile(this.workspaceId, file);
+
+    return {
+      nodes_created: createdNodes.length,
+      edges_created: createdEdges.length,
+    };
   }
 
   async updateNode(

@@ -42,14 +42,40 @@ const EDGE_COLOR_FALLBACK = "rgba(225, 205, 175, 0.90)"; // same as custom
 
 // Legend entries — keyed by CanvasEdgeKind (the user-facing vocabulary),
 // mapped through the internal palette. Exported so the UI legend always
-// matches what drawEdges2D paints.
-export const LEGEND_EDGE_KINDS: Array<{ label: string; color: string }> = [
-  { label: "calls",   color: EDGE_COLOR.calls },
-  { label: "imports", color: EDGE_COLOR.import },
-  { label: "reads",   color: EDGE_COLOR.type_only },
-  { label: "writes",  color: EDGE_COLOR.dynamic_import },
-  { label: "control", color: EDGE_COLOR.side_effect },
-  { label: "custom",  color: EDGE_COLOR.custom },
+// matches what drawEdges2D paints. `hint` is a short plain-English
+// description shown in the legend popover; doubles as an onboarding
+// glossary for devs new to these relationship categories.
+export const LEGEND_EDGE_KINDS: Array<{ label: string; color: string; hint: string }> = [
+  {
+    label: "calls",
+    color: EDGE_COLOR.calls,
+    hint: "One module invokes a function in another (runtime call).",
+  },
+  {
+    label: "imports",
+    color: EDGE_COLOR.import,
+    hint: "One module pulls in another at load time (static dependency).",
+  },
+  {
+    label: "reads",
+    color: EDGE_COLOR.type_only,
+    hint: "Consumes data or state from another source without mutating it.",
+  },
+  {
+    label: "writes",
+    color: EDGE_COLOR.dynamic_import,
+    hint: "Mutates, persists, or sends data to another destination.",
+  },
+  {
+    label: "control",
+    color: EDGE_COLOR.side_effect,
+    hint: "Triggers, gates, or dispatches — event wiring, not direct calls.",
+  },
+  {
+    label: "custom",
+    color: EDGE_COLOR.custom,
+    hint: "Caller-defined relationship; read the edge label for specifics.",
+  },
 ];
 
 function boxOf(viewport: ViewportState, n: NodeState): PixelBox {

@@ -4,6 +4,13 @@
 import { readOrInitConfig } from "../../daemon/persist/config.js";
 import type { Workspace } from "../../shared/workspace.js";
 
+// Every write request from the CLI carries this header. The daemon's
+// write guard rejects ad-hoc curl/CC-falling-back-to-bash with 403, but
+// accepts three provenance channels: browser (same-origin), MCP server
+// (tagged "mcp"), and CLI (tagged "cli"). Keeps the origin distinct in
+// logs and audit trails.
+const CLI_CLIENT_HEADER = { "X-Schematic-Client": "cli" } as const;
+
 export async function daemonUrl(path: string): Promise<string> {
   const cfg = await readOrInitConfig();
   return `http://127.0.0.1:${cfg.port}${path}`;
@@ -59,7 +66,7 @@ export async function listWorkspaces(): Promise<Workspace[]> {
 export async function createWorkspace(path: string): Promise<Workspace> {
   const r = await fetch(await daemonUrl("/workspaces"), {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: { "Content-Type": "application/json", ...CLI_CLIENT_HEADER },
     body: JSON.stringify({ path }),
   });
   if (!r.ok) throw new Error(`[schematic] POST /workspaces failed: ${r.status} ${await r.text()}`);
@@ -69,7 +76,7 @@ export async function createWorkspace(path: string): Promise<Workspace> {
 export async function transitionWorkspace(id: string, to: "active" | "paused" | "disabled"): Promise<Workspace> {
   const r = await fetch(await daemonUrl(`/workspaces/${id}/state`), {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: { "Content-Type": "application/json", ...CLI_CLIENT_HEADER },
     body: JSON.stringify({ to }),
   });
   if (!r.ok) throw new Error(`[schematic] state transition failed: ${r.status} ${await r.text()}`);
@@ -77,7 +84,10 @@ export async function transitionWorkspace(id: string, to: "active" | "paused" | 
 }
 
 export async function forgetWorkspace(id: string): Promise<void> {
-  const r = await fetch(await daemonUrl(`/workspaces/${id}`), { method: "DELETE" });
+  const r = await fetch(await daemonUrl(`/workspaces/${id}`), {
+    method: "DELETE",
+    headers: { ...CLI_CLIENT_HEADER },
+  });
   if (!r.ok) throw new Error(`[schematic] forget failed: ${r.status} ${await r.text()}`);
 }
 
