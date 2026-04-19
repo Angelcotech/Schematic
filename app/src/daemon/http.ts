@@ -11,6 +11,7 @@ import type { HookPayload } from "../shared/hook-payload.js";
 import type { Workspace } from "../shared/workspace.js";
 import type { WorkspaceRegistry } from "./workspaces/registry.js";
 import type { WSBroadcaster } from "./ws.js";
+import { dirname } from "node:path";
 import { newWorkspace, route } from "./workspaces/router.js";
 import type { ActivationManager } from "./workspaces/activate.js";
 import type { CanvasStoreRegistry } from "./canvas/store.js";
@@ -544,7 +545,15 @@ interface HookResult {
 
 async function handleHook(ctx: DaemonContext, payload: HookPayload): Promise<HookResult> {
   ctx.state.eventCount++;
-  const routed = await route(payload.cwd, ctx.registry);
+
+  // Resolve from the most specific path this hook carries. A target file
+  // path is more precise than the session's cwd — it IS the exact file on
+  // disk the tool is about to touch, so it unambiguously belongs to
+  // whichever workspace owns that file. cwd is only used when there's no
+  // target (UserPromptSubmit, Bash without file args). One path, no
+  // fallback logic.
+  const resolveFrom = payload.target ? dirname(payload.target) : payload.cwd;
+  const routed = await route(resolveFrom, ctx.registry);
 
   let workspace: Workspace | null = routed.workspace;
 

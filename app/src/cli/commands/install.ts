@@ -4,7 +4,7 @@ import { fileURLToPath } from "node:url";
 import { SCHEMATIC_HOME } from "../../daemon/persist/paths.js";
 import { readOrInitConfig } from "../../daemon/persist/config.js";
 import { generateHookScript } from "../hook-template.js";
-import { CLAUDE_SETTINGS, installSchematicEntries } from "../utils/settings-writer.js";
+import { installSchematicEntries } from "../utils/settings-writer.js";
 import { isDaemonRunning } from "../utils/daemon-client.js";
 import { start as startCmd } from "./start.js";
 
@@ -27,8 +27,12 @@ export async function install(): Promise<void> {
   await chmod(hookScriptPath, 0o755);
   console.log(`✔ hook script written to ${hookScriptPath}`);
 
-  await installSchematicEntries({ hookScriptPath, mcpServerPath });
-  console.log(`✔ ${CLAUDE_SETTINGS} updated (MCP entry + 3 hooks)`);
+  const installResult = await installSchematicEntries({ hookScriptPath, mcpServerPath });
+  console.log(`✔ Claude Code wired up — 3 hooks + MCP server registered`);
+  for (const warning of installResult.warnings) {
+    console.log("");
+    console.log(`⚠ ${warning}`);
+  }
 
   if (!(await isDaemonRunning())) {
     await startCmd();

@@ -5,7 +5,8 @@ export type EdgeKind =
   | "side_effect"
   | "calls"
   | "extends"
-  | "implements";
+  | "implements"
+  | "custom";
 
 export interface Edge {
   source: string;

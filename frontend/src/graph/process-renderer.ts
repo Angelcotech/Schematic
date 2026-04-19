@@ -12,12 +12,12 @@ import { dataToPixel, type ViewportState } from "../webgl/viewport.js";
 
 const GROUP_PADDING_PX = 14;
 const GROUP_HEADER_PX = 18;
-const GROUP_BORDER_COLOR = "rgba(255, 255, 255, 0.15)";
-// Slightly darker than the viewport background so groups read as recessed
-// panels rather than floating tint. Reads clearly against #1c1c1c.
-const GROUP_FILL_COLOR = "rgba(0, 0, 0, 0.22)";
-const GROUP_LABEL_BG = "rgba(30, 30, 30, 0.92)";
-const GROUP_LABEL_FG = "rgba(220, 220, 220, 0.95)";
+// Blueprint-tinted cyan border with a darker navy fill — reads as a
+// recessed panel on the navy bg, echoes the schematic/blueprint theme.
+const GROUP_BORDER_COLOR = "rgba(140, 200, 235, 0.35)";
+const GROUP_FILL_COLOR = "rgba(0, 12, 28, 0.30)";
+const GROUP_LABEL_BG = "rgba(18, 35, 52, 0.95)";
+const GROUP_LABEL_FG = "rgba(220, 235, 245, 0.95)";
 
 // Shared pixel-rect computation. Used by both rendering and hit testing so
 // the click target and the visual target stay identical as the user pans

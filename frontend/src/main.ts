@@ -42,7 +42,9 @@ import {
 import {
   drawEdges2D,
   hitTestEdge,
+  computeNodeAttachments,
   LEGEND_EDGE_KINDS,
+  type NodeAttachments,
 } from "./graph/edge-renderer-2d.js";
 import { drawProcessGroups, hitTestProcessGroup } from "./graph/process-renderer.js";
 import { hitTest } from "./graph/hit-test.js";
@@ -135,6 +137,21 @@ let viewport: ViewportState = {
 let cursorPx = -1;
 let cursorPy = -1;
 
+// Cached attachment/height computation for the current frame. Refreshed
+// at the top of renderAll so hit-test and downstream adapters see the
+// same effective heights without recomputing.
+let currentAttachments: NodeAttachments = { slots: new Map(), effectiveHeights: new Map() };
+
+// Returns the app.nodes list with each node's height replaced by its
+// cached effective height — matches what the user visually sees, so
+// hit-tests and process-group bounding-box math stay aligned.
+function effectiveCanvasNodes(): CanvasNode[] {
+  return app.nodes.map((cn) => ({
+    ...cn,
+    height: currentAttachments.effectiveHeights.get(cn.id) ?? cn.height,
+  }));
+}
+
 // ---------------------------------------------------------------------------
 // Render-adapter: CanvasNode + FileActivity → NodeState shape the node
 // renderer already knows how to paint. Kept tight so the one-file-many-nodes
@@ -166,6 +183,11 @@ function toRenderNode(cn: CanvasNode): NodeState {
   const ai_intent: AiIntent = activity?.ai_intent ?? "idle";
   const health: Health = activity?.health ?? "unknown";
 
+  // Effective height from the current attachment pass — auto-grows a
+  // node upward when one of its sides has too many edges to fit. Authored
+  // y stays at the bottom; the box just extends further up.
+  const effectiveHeight = currentAttachments.effectiveHeights.get(cn.id) ?? cn.height;
+
   const node: NodeState = {
     id: cn.id,
     path: cn.file_path,
@@ -179,7 +201,7 @@ function toRenderNode(cn: CanvasNode): NodeState {
     x: cn.x,
     y: cn.y,
     width: cn.width,
-    height: cn.height,
+    height: effectiveHeight,
     manually_positioned: true,
     manually_sized: true,
     layout_locked: false,
@@ -201,17 +223,22 @@ function toRenderNode(cn: CanvasNode): NodeState {
 }
 
 // Edge adapter: drawEdges2D expects {source, target} as node ids; CanvasEdge
-// uses {src, dst}. Trivial shim, kept here to avoid leaking vocabulary.
+// uses {src, dst}. Maps each CanvasEdgeKind to the legacy Edge kind name
+// whose color slot we're using. Every kind now gets a distinct color —
+// "custom" no longer collides with "imports".
 function toRenderEdge(ce: CanvasEdge): Edge {
+  const canvasKind = ce.kind ?? "custom";
+  const legacyKind =
+    canvasKind === "imports" ? "import"
+    : canvasKind === "calls" ? "calls"
+    : canvasKind === "reads" ? "type_only"
+    : canvasKind === "writes" ? "dynamic_import"
+    : canvasKind === "control" ? "side_effect"
+    : "custom"; // CanvasEdgeKind "custom" gets its own palette entry
   const edge: Edge = {
     source: ce.src,
     target: ce.dst,
-    kind: (ce.kind ?? "custom") === "imports" ? "import"
-        : ce.kind === "calls" ? "calls"
-        : ce.kind === "reads" ? "type_only"   // reuse gray palette entry
-        : ce.kind === "writes" ? "dynamic_import"
-        : ce.kind === "control" ? "side_effect"
-        : "import",
+    kind: legacyKind,
     highlighted: false,
   };
   if (ce.label !== undefined) edge.label = ce.label;
@@ -233,8 +260,24 @@ function requestFrame(): void {
 }
 
 function renderAll(): void {
+  // Refresh the shared attachment/effective-height cache first. Every
+  // downstream consumer (toRenderNode, hit-test, edge routing) reads
+  // from it so they stay in sync within one frame.
+  const attachmentNodes = app.nodes.map((cn) => ({
+    id: cn.id, x: cn.x, y: cn.y, width: cn.width, height: cn.height,
+  }) as unknown as NodeState);
+  currentAttachments = computeNodeAttachments(attachmentNodes, app.edges.map(toRenderEdge));
+
   const renderNodes = app.nodes.map(toRenderNode);
   const renderEdges = app.edges.map(toRenderEdge);
+
+  // Auto-grown heights mean the process-group bounding box math also
+  // needs to see the taller nodes. Build a parallel node list with the
+  // effective heights baked back into CanvasNode shape.
+  const processNodes: CanvasNode[] = app.nodes.map((cn) => ({
+    ...cn,
+    height: currentAttachments.effectiveHeights.get(cn.id) ?? cn.height,
+  }));
 
   // WebGL canvas just provides the cleared background now; all drawing
   // happens in the 2D overlay above it. Render with empty draws so the
@@ -244,13 +287,17 @@ function renderAll(): void {
   clearOverlay(overlay);
   const c2d = overlay.ctx;
 
-  // Process groups first — subtle backdrop behind everything else.
-  drawProcessGroups(c2d, viewport, app.nodes);
+  // Blueprint dot grid — anchored in data space so it pans/zooms with
+  // the view, giving the canvas a proper drafting-surface feel.
+  drawDotGrid(c2d);
+
+  // Process groups next — subtle backdrop behind everything else.
+  drawProcessGroups(c2d, viewport, processNodes);
 
   // Edges next so the node fills paint on top of them, which naturally
   // replaces the old clearRect node-mask trick: rounded nodes cover any
   // edge that routes through their rect.
-  drawEdges2D(c2d, viewport, renderEdges, renderNodes);
+  drawEdges2D(c2d, viewport, renderEdges, renderNodes, currentAttachments);
 
   // Nodes with rounded corners, language accent strip, halo, and border.
   drawNodes2D(c2d, viewport, renderNodes);
@@ -265,6 +312,41 @@ function renderAll(): void {
   // shown/hidden by updateEmptyState(). No draw here.
 }
 
+// Draws a data-space dot grid — dots at every GRID_SPACING_DATA units.
+// Spacing adapts with zoom: if pixels-per-data-unit drops low, we step
+// by 2x or 4x to avoid a visually dense wall of dots.
+function drawDotGrid(c2d: CanvasRenderingContext2D): void {
+  if (app.nodes.length === 0) return; // empty canvas — skip decoration
+
+  const baseSpacing = 40;
+  const pxPerUnitX = viewport.width / (viewport.xMax - viewport.xMin);
+  const pxPerUnitY = viewport.height / (viewport.yMax - viewport.yMin);
+  const pxPerUnit = Math.min(pxPerUnitX, pxPerUnitY);
+
+  // Pick a spacing that renders between ~14 and ~56 pixels on screen.
+  // Step by powers of 2 so zoom feels like snapping, not gradual density.
+  let spacing = baseSpacing;
+  while (spacing * pxPerUnit < 14) spacing *= 2;
+  while (spacing * pxPerUnit > 56 && spacing > 4) spacing /= 2;
+
+  const startX = Math.ceil(viewport.xMin / spacing) * spacing;
+  const endX = viewport.xMax;
+  const startY = Math.ceil(viewport.yMin / spacing) * spacing;
+  const endY = viewport.yMax;
+
+  c2d.save();
+  c2d.fillStyle = "rgba(140, 200, 235, 0.09)";
+  for (let x = startX; x <= endX; x += spacing) {
+    for (let y = startY; y <= endY; y += spacing) {
+      const { px, py } = dataToPixel(viewport, x, y);
+      c2d.beginPath();
+      c2d.arc(px, py, 1.1, 0, Math.PI * 2);
+      c2d.fill();
+    }
+  }
+  c2d.restore();
+}
+
 function drawStatusLine(c2d: CanvasRenderingContext2D): void {
   c2d.font = "11px -apple-system, BlinkMacSystemFont, sans-serif";
   c2d.fillStyle = "rgba(200, 200, 200, 0.6)";
@@ -272,12 +354,13 @@ function drawStatusLine(c2d: CanvasRenderingContext2D): void {
   c2d.textBaseline = "top";
   const ws = app.workspaces.find((w) => w.id === app.activeWorkspaceId);
   const cvs = app.canvases.find((c) => c.id === app.activeCanvasId);
-  const parts: string[] = [
-    `${app.connection === "open" ? "●" : "○"} daemon`,
-    `workspace: ${ws?.name ?? "(none)"}`,
-    `canvas: ${cvs?.name ?? "(none)"}`,
-    `${app.nodes.length} nodes`,
-  ];
+  // Daemon status surfaces only when something's wrong. The ● dot next
+  // to "daemon" was purely decorative — it never changed in normal use.
+  const parts: string[] = [];
+  if (app.connection !== "open") parts.push("⚠ daemon disconnected");
+  parts.push(`workspace: ${ws?.name ?? "(none)"}`);
+  parts.push(`canvas: ${cvs?.name ?? "(none)"}`);
+  parts.push(`${app.nodes.length} nodes`);
   c2d.fillText(parts.join("  —  "), 8, 8);
 }
 
@@ -743,7 +826,7 @@ canvas.addEventListener("contextmenu", (e) => {
     openNodeMenu(e.clientX, e.clientY, hitNode);
     return;
   }
-  const hitGroup = hitTestProcessGroup(overlay.ctx, viewport, app.nodes, px, py);
+  const hitGroup = hitTestProcessGroup(overlay.ctx, viewport, effectiveCanvasNodes(), px, py);
   if (hitGroup) {
     openProcessMenu(e.clientX, e.clientY, hitGroup.process, hitGroup.memberIds);
     return;
@@ -1359,7 +1442,7 @@ canvas.addEventListener("mousedown", (e) => {
     // No node under the cursor — try a process group. A hit on the group's
     // border ring or header pill drags every member together. The interior
     // of the group falls through so overlapping groups stay reachable.
-    const groupHit = hitTestProcessGroup(overlay.ctx, viewport, app.nodes, px, py);
+    const groupHit = hitTestProcessGroup(overlay.ctx, viewport, effectiveCanvasNodes(), px, py);
     if (groupHit) {
       drag = beginNodeDrag(groupHit.memberIds, px, py);
       canvas.style.cursor = "grabbing";
@@ -1463,7 +1546,7 @@ window.addEventListener("mousemove", (e) => {
       const renderNodes = app.nodes.map(toRenderNode);
       const renderEdges = app.edges.map(toRenderEdge);
       // The adapter loses the CanvasEdge.id, so recover by position.
-      const hit = hitTestEdge(viewport, renderEdges, renderNodes, cursorPx, cursorPy);
+      const hit = hitTestEdge(viewport, renderEdges, renderNodes, currentAttachments, cursorPx, cursorPy);
       if (hit) {
         const idx = renderEdges.indexOf(hit);
         if (idx >= 0 && app.edges[idx]) edgeHit = app.edges[idx].id;

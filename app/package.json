@@ -1,24 +1,25 @@
 {
-  "name": "schematic",
+  "name": "claude-schematic",
   "version": "0.0.1",
-  "description": "Live architecture map companion for Claude Code — click a file in the browser, Claude knows what you mean.",
+  "description": "Ask Claude Code to draw live architecture diagrams of your repo. Interactive canvas, MCP tools, and right-click actions for blast-radius and audit queries.",
   "keywords": [
     "claude-code",
     "claude",
     "architecture",
-    "graph",
+    "diagram",
+    "canvas",
     "mcp",
     "hooks",
     "typescript"
   ],
   "license": "MIT",
-  "author": "David Alan Brown",
+  "author": "David Alan Brown (Angelco)",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/dvidartist-hub/Schematic.git"
+    "url": "git+https://github.com/Angelcotech/Schematic.git"
   },
-  "homepage": "https://github.com/dvidartist-hub/Schematic#readme",
-  "bugs": "https://github.com/dvidartist-hub/Schematic/issues",
+  "homepage": "https://github.com/Angelcotech/Schematic#readme",
+  "bugs": "https://github.com/Angelcotech/Schematic/issues",
   "type": "module",
   "bin": {
     "schematic": "./dist/cli/index.js"

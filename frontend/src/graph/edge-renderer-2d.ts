@@ -24,29 +24,32 @@ interface PixelBox {
   cy: number;
 }
 
-// Rough color palette. Alpha kept high so edges read against the dark WebGL
-// background. Weight-based thickness is applied on top (see strokeForEdge).
+// Edge palette tuned for the near-black blueprint bg. Six distinct hues
+// for the six CanvasEdgeKinds, chosen so no two kinds read as the same
+// color at a glance. "Custom" is warm beige — clearly different from the
+// structural imports gray.
 const EDGE_COLOR: Record<string, string> = {
-  import:         "rgba(170, 175, 185, 0.85)",
-  dynamic_import: "rgba(210, 170, 110, 0.85)",
-  type_only:      "rgba(140, 140, 160, 0.55)",
-  side_effect:    "rgba(190, 130, 190, 0.80)",
-  calls:          "rgba(110, 200, 200, 0.85)",
-  extends:        "rgba(220, 200, 120, 0.85)",
-  implements:     "rgba(150, 210, 130, 0.85)",
+  calls:          "rgba(94, 192, 229, 0.95)",   // brand cyan
+  import:         "rgba(180, 195, 215, 0.85)",  // pale steel (imports)
+  type_only:      "rgba(130, 220, 160, 0.90)",  // soft green (reads)
+  dynamic_import: "rgba(245, 180, 80, 0.90)",   // warm orange (writes)
+  side_effect:    "rgba(200, 140, 230, 0.90)",  // violet (control)
+  custom:         "rgba(225, 205, 175, 0.90)",  // warm beige (custom)
+  extends:        "rgba(220, 200, 120, 0.85)",  // yellow (unused by canvas kinds)
+  implements:     "rgba(150, 210, 130, 0.85)",  // vestigial
 };
-const EDGE_COLOR_FALLBACK = "rgba(170, 175, 185, 0.85)";
+const EDGE_COLOR_FALLBACK = "rgba(225, 205, 175, 0.90)"; // same as custom
 
 // Legend entries — keyed by CanvasEdgeKind (the user-facing vocabulary),
-// mapped through the old legacy Edge kind palette. Exported so the UI
-// legend always matches what drawEdges2D actually paints.
+// mapped through the internal palette. Exported so the UI legend always
+// matches what drawEdges2D paints.
 export const LEGEND_EDGE_KINDS: Array<{ label: string; color: string }> = [
   { label: "calls",   color: EDGE_COLOR.calls },
   { label: "imports", color: EDGE_COLOR.import },
   { label: "reads",   color: EDGE_COLOR.type_only },
   { label: "writes",  color: EDGE_COLOR.dynamic_import },
   { label: "control", color: EDGE_COLOR.side_effect },
-  { label: "custom",  color: EDGE_COLOR_FALLBACK },
+  { label: "custom",  color: EDGE_COLOR.custom },
 ];
 
 function boxOf(viewport: ViewportState, n: NodeState): PixelBox {
@@ -72,14 +75,102 @@ type Pt = { x: number; y: number };
 // segments at the same X and look like one thick wire.
 //
 // Each edge exits the LEFT or RIGHT side of its source/target (never top
-// or bottom — label pills live there). For stairs, the midX is initially
-// `(exit + enter) / 2`; we then bucket edges by rounded midX and offset
-// each bucket member to its own lane so vertical segments separate.
-//
-// Horizontal edges (exit and enter at the same Y) aren't laned — they
-// naturally line up, which is desirable when they share a source.
+// or bottom — label pills live there). Per-edge Y attachments come from
+// the slot map computed by computeNodeAttachments so arrows don't pile
+// up on the same spot.
 const LANE_BUCKET_PX = 50;
 const LANE_SPACING_PX = 10;
+
+// Per-node-side attachment spacing. Each attached edge gets its own slot
+// Y so arrowheads and horizontal segments naturally separate. Node height
+// auto-grows (upward from the authored y) when a side has too many edges
+// to fit comfortably.
+const SLOT_PADDING_DATA = 4;   // top/bottom padding inside node (data units)
+const SLOT_MIN_SPACING_DATA = 10;
+
+// The slot assignment for a single edge, expressed as Y fractions (0 =
+// top of node, 1 = bottom) on the source and target sides.
+interface SlotAssignment {
+  srcYFrac: number;
+  dstYFrac: number;
+}
+
+export interface NodeAttachments {
+  slots: Map<number, SlotAssignment>;        // keyed by edge index
+  effectiveHeights: Map<string, number>;     // nodeId → rendered height in data units
+}
+
+// Precomputes per-edge slot positions and per-node effective heights for
+// a given frame. Returned once and reused by both drawEdges2D (for
+// routing) and the node renderer (for height) so they stay in sync.
+export function computeNodeAttachments(
+  nodes: NodeState[],
+  edges: Edge[],
+): NodeAttachments {
+  const byId = new Map<string, NodeState>();
+  for (const n of nodes) byId.set(n.id, n);
+
+  // Per-node, per-side collections. Each entry holds the edge index, the
+  // OTHER endpoint's center-Y (for sort-to-minimize-crossings), and a
+  // flag for whether this endpoint is the source or target.
+  interface SideEntry { edgeIdx: number; otherCy: number; isSrc: boolean; }
+  const leftOf = new Map<string, SideEntry[]>();
+  const rightOf = new Map<string, SideEntry[]>();
+  const push = (map: Map<string, SideEntry[]>, id: string, e: SideEntry): void => {
+    let arr = map.get(id);
+    if (!arr) { arr = []; map.set(id, arr); }
+    arr.push(e);
+  };
+
+  edges.forEach((edge, edgeIdx) => {
+    const s = byId.get(edge.source);
+    const d = byId.get(edge.target);
+    if (!s || !d) return;
+    if (s.id === d.id) return; // self-loop; unsupported in v1
+    const srcCx = s.x + s.width / 2;
+    const dstCx = d.x + d.width / 2;
+    const goRight = dstCx >= srcCx;
+    const srcSide = goRight ? rightOf : leftOf;
+    const dstSide = goRight ? leftOf : rightOf;
+    push(srcSide, s.id, { edgeIdx, otherCy: d.y + d.height / 2, isSrc: true });
+    push(dstSide, d.id, { edgeIdx, otherCy: s.y + s.height / 2, isSrc: false });
+  });
+
+  const slots = new Map<number, SlotAssignment>();
+  const effectiveHeights = new Map<string, number>();
+
+  // Process each node's side. Sort entries by the other endpoint's Y
+  // descending — larger data-y = higher on screen (data y-up, screen
+  // y-down), so the edge from the highest-on-screen endpoint takes the
+  // top slot. This minimizes edge crossings.
+  function processSide(entries: SideEntry[]): void {
+    entries.sort((a, b) => b.otherCy - a.otherCy);
+    const n = entries.length;
+    entries.forEach((entry, i) => {
+      const yFrac = (i + 0.5) / n;
+      let a = slots.get(entry.edgeIdx);
+      if (!a) {
+        a = { srcYFrac: 0.5, dstYFrac: 0.5 };
+        slots.set(entry.edgeIdx, a);
+      }
+      if (entry.isSrc) a.srcYFrac = yFrac;
+      else a.dstYFrac = yFrac;
+    });
+  }
+
+  for (const node of nodes) {
+    const left = leftOf.get(node.id) ?? [];
+    const right = rightOf.get(node.id) ?? [];
+    processSide(left);
+    processSide(right);
+
+    const maxSide = Math.max(left.length, right.length);
+    const required = maxSide * SLOT_MIN_SPACING_DATA + 2 * SLOT_PADDING_DATA;
+    effectiveHeights.set(node.id, Math.max(node.height, required));
+  }
+
+  return { slots, effectiveHeights };
+}
 
 interface EdgePlan {
   edge: Edge;
@@ -93,12 +184,19 @@ interface EdgePlan {
   isStair: boolean;
 }
 
-function planEdge(s: PixelBox, d: PixelBox, edge: Edge): EdgePlan {
+function planEdge(
+  s: PixelBox,
+  d: PixelBox,
+  edge: Edge,
+  slot: SlotAssignment,
+): EdgePlan {
   const goRight = d.cx >= s.cx;
   const exitX = goRight ? s.right : s.left;
   const enterX = goRight ? d.left : d.right;
-  const exitY = s.cy;
-  const enterY = d.cy;
+  // Map the slot fractions (0 at top of node, 1 at bottom) to pixel Y.
+  // s.top is the smaller py (higher on screen); s.bottom is larger.
+  const exitY = s.top + slot.srcYFrac * (s.bottom - s.top);
+  const enterY = d.top + slot.dstYFrac * (d.bottom - d.top);
   const isStair = Math.abs(exitY - enterY) >= 1.5;
   let baseMidX = (exitX + enterX) / 2;
   const midInsideSrc = baseMidX > s.left - 2 && baseMidX < s.right + 2;
@@ -115,17 +213,19 @@ function computeRoutes(
   viewport: ViewportState,
   edges: Edge[],
   nodes: NodeState[],
+  attachments: NodeAttachments,
 ): Array<{ edge: Edge; pts: Pt[] }> {
   const byId = new Map<string, NodeState>();
   for (const n of nodes) byId.set(n.id, n);
 
   const plans: EdgePlan[] = [];
-  for (const e of edges) {
+  edges.forEach((e, edgeIdx) => {
     const src = byId.get(e.source);
     const dst = byId.get(e.target);
-    if (!src || !dst) continue;
-    plans.push(planEdge(boxOf(viewport, src), boxOf(viewport, dst), e));
-  }
+    if (!src || !dst) return;
+    const slot = attachments.slots.get(edgeIdx) ?? { srcYFrac: 0.5, dstYFrac: 0.5 };
+    plans.push(planEdge(boxOf(viewport, src), boxOf(viewport, dst), e, slot));
+  });
 
   // Bucket stair plans by rounded baseMidX. Within a bucket, sort by
   // (s.cy, d.cy) for stable ordering, then offset each member's midX by
@@ -247,6 +347,7 @@ export function drawEdges2D(
   viewport: ViewportState,
   edges: Edge[],
   nodes: NodeState[],
+  attachments: NodeAttachments,
 ): void {
   if (edges.length === 0) return;
 
@@ -254,7 +355,7 @@ export function drawEdges2D(
   c2d.lineCap = "round";
   c2d.lineJoin = "round";
 
-  for (const { edge, pts } of computeRoutes(viewport, edges, nodes)) {
+  for (const { edge, pts } of computeRoutes(viewport, edges, nodes, attachments)) {
     if (pts.length < 2) continue;
 
     const color = EDGE_COLOR[edge.kind] ?? EDGE_COLOR_FALLBACK;
@@ -281,6 +382,7 @@ export function hitTestEdge(
   viewport: ViewportState,
   edges: Edge[],
   nodes: NodeState[],
+  attachments: NodeAttachments,
   pixelX: number,
   pixelY: number,
   thresholdPx = 6,
@@ -291,7 +393,7 @@ export function hitTestEdge(
   let bestDist = thresholdPx;
   // Use the same lane-aware routes that drawEdges2D draws, so hit targets
   // match what the user sees.
-  for (const { edge, pts } of computeRoutes(viewport, edges, nodes)) {
+  for (const { edge, pts } of computeRoutes(viewport, edges, nodes, attachments)) {
     for (let i = 0; i < pts.length - 1; i++) {
       const d = pointSegmentDistance(pixelX, pixelY, pts[i], pts[i + 1]);
       if (d < bestDist) {

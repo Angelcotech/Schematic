@@ -1,53 +1,62 @@
 # Schematic
 
-Live architecture map companion for Claude Code. Click a file in the browser — Claude knows what you mean.
+Ask Claude Code to draw live architecture diagrams of your repo.
 
-Schematic runs as a local daemon beside Claude Code. It watches your repo, renders an interactive WebGL graph of modules and files, and keeps Claude's view of the codebase in sync with yours. When you click a file, Claude's next tool call can read it. When Claude reads a file, the node lights up on your screen.
+Schematic turns Claude Code into a draftsman. You tell it what to map — "diagram the WebGL pipeline," "extract the G1 engine," "how does auth connect to the API layer" — and Claude authors a canvas for you in your browser. Nodes are files, edges are labeled relationships, processes group related pieces. When Claude reads or edits a file, the matching node glows. When you click around in the browser, Claude-ready prompts land on your clipboard.
 
 ## Install
 
 ```
-npm install -g schematic
+npm install -g claude-schematic
 schematic install
 ```
 
-`install` wires three Claude Code hooks and an MCP entry into `~/.claude/settings.json`, starts the daemon on `localhost:7777`, and opens the dashboard in your browser.
+That writes three Claude Code hooks to `~/.claude/settings.json`, registers an MCP server via `claude mcp add`, starts the daemon on `localhost:7777`, and opens the dashboard in your browser. If port 7777 is busy, it auto-picks the next free port up to 7800.
 
 ## Use
 
-Work in Claude Code normally. In any repo with a `.schematic.json` at the root, Schematic auto-activates: file edits appear on the map in real time; clicking a node tells Claude what you're looking at.
+Open a Claude Code session and talk to it normally. Try:
+
+- **"Open GateStack in Schematic."** — Claude calls `open_workspace`, registers your repo, and flips the browser to it.
+- **"Diagram the WebGL pipeline."** — Claude reads the code, creates a canvas, places nodes, labels edges, arranges by data flow.
+- **"Before I change `app/src/daemon/http.ts`, trace its impact."** — Claude calls `trace_impact`, reports every canvas that touches that file and what connects to it.
+
+In the browser, **right-click** anything:
+
+- **Right-click a file node** → copy "Blast radius," "Explain this file," or "Create canvas centered on this file" prompts.
+- **Right-click a process container** → copy "Audit this group" or "Extract this process to its own canvas."
+- **Right-click empty canvas** → copy "Audit canvas / Find hubs / Find orphans / Find cycles" prompts.
+
+Every right-click action runs the query, packs the result into a Claude-ready prompt, and copies it to your clipboard. Paste into Claude and hit send.
+
+## What Claude can do
+
+Thirteen MCP tools ship in the box:
+
+**Workspace management:** `open_workspace`, `list_workspaces`, `switch_view`, `pause_workspace`.
+
+**Canvas authoring:** `create_canvas`, `list_canvases`, `add_node`, `add_edge`, `move_node`, `delete_node`, `delete_edge`.
+
+**Structural queries:** `trace_impact` (blast radius before refactors), `audit_canvas` (drift vs disk), `find_hubs` (high-degree keystones), `find_orphans` (zero-edge nodes), `find_cycles` (circular dependencies).
+
+All five structural-query tools return JSON, so Claude can reason over the shape instead of parsing prose.
+
+## CLI
 
 ```
-schematic activate .        # opt-in to the current repo
-schematic status            # daemon health
-schematic stop              # shut down
-schematic uninstall         # remove hooks + MCP entry
+schematic install            # wire hooks + MCP, start daemon
+schematic start              # start daemon (no-op if running)
+schematic stop               # graceful shutdown
+schematic status             # uptime, workspace count, event count
+schematic uninstall          # remove hooks + MCP, stop daemon
+schematic config get port    # show daemon port
+schematic config set port N  # change port (takes effect on next daemon start)
 ```
-
-## Configure a repo
-
-Add `.schematic.json` at the repo root:
-
-```json
-{
-  "modules": {
-    "app":      { "include": ["app/**"] },
-    "frontend": { "include": ["frontend/**"] }
-  },
-  "health": {
-    "sources": [
-      { "kind": "tsc", "cwd": "app" }
-    ]
-  }
-}
-```
-
-Modules become colored boxes; files become nodes inside them. Health sources (currently `tsc --watch`) drive red/green state on each file.
 
 ## Requirements
 
-Node 20+. macOS, Linux, or Windows.
+Node 20+. macOS, Linux, or Windows. Claude Code installed and working.
 
 ## License
 
-MIT
+MIT · © 2026 Angelco · [angelco.tech](https://angelco.tech)

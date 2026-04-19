@@ -9,11 +9,11 @@ import { dataToPixel, type ViewportState } from "../webgl/viewport.js";
 
 // --- Color palette (curated; no theme toggles per "curated smooth") -------
 
-// Muted slate for file nodes. Language comes through a thin accent pill
-// on the left, not via the fill, so edges and process groups stay the
-// primary architecture signal.
-const FILE_FILL = "rgb(51, 51, 56)";
-const FILE_FILL_RGB = { r: 0.20, g: 0.20, b: 0.22 };
+// Muted slate-navy for file nodes. Blueprint-tinted so the fill picks up
+// the canvas theme, but not so saturated that language accent strips
+// fight with it. Language comes through the thin accent pill on the left.
+const FILE_FILL = "rgb(38, 54, 76)";
+const FILE_FILL_RGB = { r: 0.149, g: 0.212, b: 0.298 };
 
 // Accent-pill color per language (CSS rgb strings for direct 2D draw).
 const LANGUAGE_ACCENT: Record<string, string> = {
