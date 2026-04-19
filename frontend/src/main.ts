@@ -66,6 +66,7 @@ const container = canvas.parentElement;
 if (!container) throw new Error("[schematic] canvas has no parent");
 const tabbarEl = requireEl<HTMLDivElement>("tabbar");
 const emptyStateEl = requireEl<HTMLDivElement>("empty-state");
+const emptyStatePanelEl = requireEl<HTMLDivElement>("empty-state-panel");
 const legendEl = requireEl<HTMLDivElement>("legend");
 const legendBtn = requireEl<HTMLDivElement>("legend-btn");
 const closedPanelEl = requireEl<HTMLDivElement>("closed-panel");
@@ -547,9 +548,117 @@ async function reopenCanvas(canvasId: string): Promise<void> {
   setClosedPanelOpen(false);
 }
 
+// Three-mode empty state — first-run welcome, no-canvases prompt, or
+// "Claude is authoring" hint when a canvas is empty and CC hooks are
+// firing. Replaces the old "only show when workspace has zero canvases"
+// behavior which left first-time users staring at a blank screen.
 function updateEmptyState(): void {
-  emptyStateEl.style.display =
-    app.activeWorkspaceId && app.canvases.length === 0 ? "flex" : "none";
+  const mode = computeEmptyStateMode();
+  if (mode === null) {
+    emptyStateEl.style.display = "none";
+    return;
+  }
+  emptyStatePanelEl.innerHTML = renderEmptyStateHTML(mode);
+  emptyStateEl.style.display = "flex";
+}
+
+type EmptyStateMode =
+  | { kind: "no-workspace" }
+  | { kind: "no-canvases"; workspaceName: string }
+  | { kind: "authoring"; workspaceName: string; canvasName: string; tool?: string; target?: string };
+
+function computeEmptyStateMode(): EmptyStateMode | null {
+  // No workspace focused — fresh install, first run, or all workspaces
+  // paused. Show the top-level welcome with first-prompt suggestion.
+  if (!app.activeWorkspaceId) return { kind: "no-workspace" };
+
+  const ws = app.workspaces.find((w) => w.id === app.activeWorkspaceId);
+  const wsName = ws?.name ?? "this workspace";
+
+  // Workspace focused but no canvases exist — "ask Claude to diagram" hint.
+  if (app.canvases.length === 0) {
+    return { kind: "no-canvases", workspaceName: wsName };
+  }
+
+  // Canvas active but empty + CC is touching files in this workspace right
+  // now. Tells the user "yes it's working, Claude is still reading/thinking"
+  // instead of silently staring at an empty canvas for minutes.
+  const activeCanvas = app.canvases.find((c) => c.id === app.activeCanvasId);
+  if (activeCanvas && app.nodes.length === 0) {
+    const act = app.lastCCActivity;
+    const freshness = act ? Date.now() - act.timestamp : Infinity;
+    if (act && freshness < 30_000 && act.workspace_id === app.activeWorkspaceId) {
+      const target = act.cwd && act.cwd !== "" ? shortenTarget(act, ws?.root) : undefined;
+      return {
+        kind: "authoring",
+        workspaceName: wsName,
+        canvasName: activeCanvas.name,
+        ...(act.tool ? { tool: act.tool } : {}),
+        ...(target ? { target } : {}),
+      };
+    }
+  }
+
+  return null;
+}
+
+// Extract a workspace-relative target path from a hook payload for display.
+// The payload's `cwd` is the session's cwd; the actual file being touched
+// lives in `tool` land — but we don't have the file_path here, only the
+// tool name + cwd. Skip target rendering; showing the tool alone is enough.
+function shortenTarget(_act: { cwd: string }, _root?: string): string | undefined {
+  return undefined;
+}
+
+function renderEmptyStateHTML(mode: EmptyStateMode): string {
+  if (mode.kind === "no-workspace") {
+    return `
+      <h1>Schematic</h1>
+      <p class="tagline">Claude Code draws architecture diagrams of your repo.</p>
+      <div class="step">
+        <div class="step-num">1</div>
+        <div class="step-body">Open Claude Code in your repo's folder.</div>
+      </div>
+      <div class="step">
+        <div class="step-num">2</div>
+        <div class="step-body">Say: <code>open this repo in schematic</code></div>
+      </div>
+      <div class="step">
+        <div class="step-num">3</div>
+        <div class="step-body">Say: <code>diagram the architecture</code> — or right-click anything once a canvas exists to copy smarter prompts.</div>
+      </div>
+    `;
+  }
+  if (mode.kind === "no-canvases") {
+    return `
+      <h1>${escapeHtml(mode.workspaceName)}</h1>
+      <p class="tagline">Workspace is open — no diagrams yet.</p>
+      <div class="step">
+        <div class="step-num">→</div>
+        <div class="step-body">In Claude Code, say something like <code>diagram the auth flow</code> or <code>map how the frontend connects to the engine</code>.</div>
+      </div>
+      <div class="step">
+        <div class="step-num">+</div>
+        <div class="step-body">Or click <code>+ new</code> at the top to start a blank canvas and populate it manually.</div>
+      </div>
+    `;
+  }
+  // authoring
+  const toolLine = mode.tool
+    ? `<span>Last tool: <code>${escapeHtml(mode.tool)}</code></span>`
+    : `<span>Claude is reading files…</span>`;
+  return `
+    <h1>${escapeHtml(mode.canvasName)}</h1>
+    <p class="tagline">Canvas created — Claude is authoring.</p>
+    <div class="step">
+      <div class="step-num">→</div>
+      <div class="step-body">Nodes appear on this canvas as Claude adds them. Reading files first takes a moment on a large repo.</div>
+    </div>
+    <div class="authoring">
+      <span class="dot"></span>
+      ${toolLine}
+    </div>
+  `;
 }
 
 // --- Legend (dropdown from the toolbar) --------------------------------
@@ -753,7 +862,12 @@ function renderCCActivity(): void {
 // Re-render every second so the fresh/stale/idle dot reflects real time
 // even when no new hooks arrive. Cheap — just toggles a class and updates
 // the tooltip string; no render loop involved.
-window.setInterval(renderCCActivity, 1000);
+window.setInterval(() => {
+  renderCCActivity();
+  // Also refresh the empty state — when Claude stops firing hooks, the
+  // "authoring" panel should fall back to the regular "no-canvases" view.
+  updateEmptyState();
+}, 1000);
 
 // --- Context menu (right-click) ---------------------------------------
 // Runs pre-fetched Schematic queries and copies a Claude-ready prompt to
@@ -1698,6 +1812,7 @@ async function bootstrap(): Promise<void> {
           timestamp: event.timestamp,
         };
         renderCCActivity();
+        updateEmptyState();
         return;
       }
     },
