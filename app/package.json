@@ -1,6 +1,6 @@
 {
   "name": "claude-schematic",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Ask Claude Code to draw live architecture diagrams of your repo. Interactive canvas, MCP tools, and right-click actions for blast-radius and audit queries.",
   "keywords": [
     "claude-code",
@@ -42,6 +42,7 @@
     "@modelcontextprotocol/sdk": "^1.0.4",
     "chokidar": "^4.0.1",
     "ignore": "^6.0.2",
+    "typescript": "^5.5.0",
     "ws": "^8.18.0",
     "zod": "^3.23.8"
   },

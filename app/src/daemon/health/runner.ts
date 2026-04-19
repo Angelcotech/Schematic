@@ -17,6 +17,11 @@ import { consumeTscChunk, createTscParserState } from "./parsers/tsc.js";
 // as a runtime dep (installed in Stage 6 for AST parsing), so this path
 // is guaranteed regardless of what the target workspace has in its own
 // node_modules.
+//
+// DO NOT move `typescript` to devDependencies — this require.resolve()
+// runs on every daemon boot and will crash the daemon if typescript isn't
+// installed alongside claude-schematic. 0.1.0 shipped without it and
+// bricked every fresh install; 0.1.1 fixed it by adding it back.
 const require = createRequire(import.meta.url);
 const TSC_BIN = require.resolve("typescript/bin/tsc");
 
