@@ -120,15 +120,19 @@ export async function installSchematicEntries(paths: InstallPaths): Promise<Inst
   // CC's internal store (~/.claude.json). Writing to settings.json
   // doesn't work in practice — CC ignores that field for MCP.
   try {
+    // Pass env explicitly — Node's execFile can miss PATH inheritance in
+    // some install contexts (npm-global install, detached subprocesses),
+    // which would make `claude` look unresolvable even when it's on PATH.
+    const execOpts = { env: process.env };
     // `remove` is idempotent-ish: fails if not present, so swallow.
-    await execFileAsync("claude", ["mcp", "remove", "-s", "user", SCHEMATIC_ID]).catch(() => {});
+    await execFileAsync("claude", ["mcp", "remove", "-s", "user", SCHEMATIC_ID], execOpts).catch(() => {});
     await execFileAsync("claude", [
       "mcp", "add",
       "-s", "user",
       SCHEMATIC_ID,
       "node",
       paths.mcpServerPath,
-    ]);
+    ], execOpts);
   } catch (e) {
     // Most common cause: `claude` CLI not on PATH, or CC version without
     // the mcp subcommand. Tell the user how to finish manually rather
@@ -151,7 +155,10 @@ export async function uninstallSchematicEntries(): Promise<void> {
   // Remove MCP registration from CC's store. Swallow errors — the entry
   // may not be present (uninstall from a partial install) or the CLI
   // may be unavailable; neither should block cleanup.
-  await execFileAsync("claude", ["mcp", "remove", "-s", "user", SCHEMATIC_ID]).catch(() => {});
+  await execFileAsync(
+    "claude", ["mcp", "remove", "-s", "user", SCHEMATIC_ID],
+    { env: process.env },
+  ).catch(() => {});
 }
 
 export { CLAUDE_SETTINGS };

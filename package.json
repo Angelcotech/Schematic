@@ -8,9 +8,10 @@
     "node": ">=20"
   },
   "scripts": {
-    "build": "pnpm --filter schematic build && pnpm --filter @schematic/frontend build && node scripts/copy-frontend.mjs",
+    "clean": "rm -rf app/dist frontend/dist",
+    "build": "pnpm clean && pnpm --filter claude-schematic build && pnpm --filter @schematic/frontend build && node scripts/copy-frontend.mjs",
     "dev": "pnpm --filter @schematic/frontend dev",
     "typecheck": "pnpm -r --parallel typecheck",
-    "pack:app": "pnpm --filter schematic pack"
+    "pack:app": "pnpm clean && pnpm build && pnpm --filter claude-schematic pack"
   }
 }

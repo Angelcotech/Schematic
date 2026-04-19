@@ -591,7 +591,10 @@ function renderLegend(): void {
     <section>
       <h4>Activity halos</h4>
       ${haloRows}
-    </section>`;
+    </section>
+    <div class="attribution">
+      Schematic · Angelco · <a href="https://angelco.tech" target="_blank" rel="noopener">angelco.tech</a>
+    </div>`;
 }
 
 function setLegendOpen(open: boolean): void {
