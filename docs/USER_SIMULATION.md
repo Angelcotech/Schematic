@@ -117,14 +117,14 @@ CC reads two files to answer. The moment the first `PreToolUse(Read)` hook fires
    {
      "event": "PreToolUse",
      "tool": "Read",
-     "file": "/Users/transcience/GateStack-Pro/src/engine/g1_vertex.ts",
-     "cwd": "/Users/transcience/GateStack-Pro",
+     "file": "~/GateStack-Pro/src/engine/g1_vertex.ts",
+     "cwd": "~/GateStack-Pro",
      "session_id": "abc-123",
      "timestamp": 1744000000000
    }
    ```
 
-2. **The daemon walks up** from `cwd` looking for a repo root. It finds `.git/` at `/Users/transcience/GateStack-Pro/`. It hashes that path → generates workspace ID `ws_f2a81c3d`. This is a new workspace.
+2. **The daemon walks up** from `cwd` looking for a repo root. It finds `.git/` at `~/GateStack-Pro/`. It hashes that path → generates workspace ID `ws_f2a81c3d`. This is a new workspace.
 
 3. **The daemon checks** for `.schematic.json` at the repo root. Not present. So no workspace is created yet — the daemon emits a one-time registration toast and waits for explicit activation.
 
@@ -299,7 +299,7 @@ They switch to their terminal, resume their work. The moment CC makes its first 
 The user `cd`s to `~/GammaGate/` in a different terminal and starts a new CC session. They ask a question. CC reads a file.
 
 **On the daemon side:**
-- Hook fires with `cwd = /Users/transcience/GammaGate`
+- Hook fires with `cwd = ~/GammaGate`
 - Daemon walks up, finds git root, hashes → workspace ID `ws_8c7e2f1a` (new)
 - Checks for `.schematic.json` at the root — **found!** (the user committed one months ago with custom module definitions)
 - Because the marker is present, auto-activation kicks in
@@ -401,7 +401,7 @@ GammaGate
   ✕  Forget          (removes from registry, deletes ~/.schematic/workspaces/<id>/)
 ```
 
-They click **Pause**. The workspace pill turns amber. tsc/eslint processes shut down gracefully. Hooks from `cwd = /Users/transcience/GammaGate/` are now dropped (no state updates). The cached graph and positions remain. When they want it back, they right-click → **Resume**, and health sources spin back up within seconds.
+They click **Pause**. The workspace pill turns amber. tsc/eslint processes shut down gracefully. Hooks from `cwd = ~/GammaGate/` are now dropped (no state updates). The cached graph and positions remain. When they want it back, they right-click → **Resume**, and health sources spin back up within seconds.
 
 ---
 
