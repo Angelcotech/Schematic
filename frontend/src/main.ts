@@ -1851,6 +1851,15 @@ async function bootstrap(): Promise<void> {
         app.canvases = [...app.canvases, event.canvas];
         renderTabs();
         updateEmptyState();
+        // Auto-switch to the newly-created canvas. Without this, CC's
+        // follow-up bulk_populate fires canvas.content_changed but the
+        // browser's active canvas is still null (no-canvases mode) or
+        // an older tab, so the handler's id-match guard drops the
+        // refresh event — and the new canvas looks empty until the
+        // user manually reloads. The author (usually CC via MCP) is
+        // always trying to draw the user's attention to the new canvas;
+        // jumping to it matches intent.
+        void switchCanvas(event.canvas.id);
         return;
       }
       if (event.type === "canvas.updated") {
