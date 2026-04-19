@@ -315,6 +315,7 @@ export function createRequestHandler(
           ...(body.height !== undefined ? { height: body.height } : {}),
           ...(body.process !== undefined ? { process: body.process } : {}),
         });
+        broadcastContentChanged(ctx, wid, cid);
         return json(res, 201, node);
       }
 
@@ -333,7 +334,9 @@ export function createRequestHandler(
           if (k in body) patch[k] = body[k];
         }
         const store = await ctx.canvasStores.getOrLoad(wid);
-        return json(res, 200, await store.updateNode(cid, nid, patch));
+        const updated = await store.updateNode(cid, nid, patch);
+        broadcastContentChanged(ctx, wid, cid);
+        return json(res, 200, updated);
       }
       if (method === "DELETE" && nodeIdMatch) {
         const wid = nodeIdMatch[1];
@@ -342,6 +345,7 @@ export function createRequestHandler(
         if (!ctx.registry.get(wid)) return err(res, 404, "unknown workspace");
         const store = await ctx.canvasStores.getOrLoad(wid);
         await store.deleteNode(cid, nid);
+        broadcastContentChanged(ctx, wid, cid);
         return json(res, 200, { ok: true });
       }
 
@@ -369,6 +373,7 @@ export function createRequestHandler(
           ...(body.label !== undefined ? { label: body.label } : {}),
           ...(kind !== undefined ? { kind } : {}),
         });
+        broadcastContentChanged(ctx, wid, cid);
         return json(res, 201, edge);
       }
 
@@ -393,7 +398,9 @@ export function createRequestHandler(
           if (parsedKind !== undefined) patch.kind = parsedKind;
         }
         const store = await ctx.canvasStores.getOrLoad(wid);
-        return json(res, 200, await store.updateEdge(cid, eid, patch));
+        const updated = await store.updateEdge(cid, eid, patch);
+        broadcastContentChanged(ctx, wid, cid);
+        return json(res, 200, updated);
       }
       if (method === "DELETE" && edgeIdMatch) {
         const wid = edgeIdMatch[1];
@@ -402,6 +409,7 @@ export function createRequestHandler(
         if (!ctx.registry.get(wid)) return err(res, 404, "unknown workspace");
         const store = await ctx.canvasStores.getOrLoad(wid);
         await store.deleteEdge(cid, eid);
+        broadcastContentChanged(ctx, wid, cid);
         return json(res, 200, { ok: true });
       }
 
@@ -452,6 +460,24 @@ export function createRequestHandler(
       return err(res, 500, message);
     }
   };
+}
+
+// Broadcasts canvas.content_changed so all browser tabs viewing this
+// workspace re-fetch the canvas data and reflect the mutation live.
+// Called after every successful node/edge add/update/delete — without
+// this, CC's incremental authoring is invisible until page refresh.
+function broadcastContentChanged(
+  ctx: DaemonContext, workspaceId: string, canvasId: string,
+): void {
+  ctx.ws.broadcast(
+    {
+      type: "canvas.content_changed",
+      workspace_id: workspaceId,
+      canvas_id: canvasId,
+      timestamp: Date.now(),
+    },
+    workspaceId,
+  );
 }
 
 // Strict edge-kind validator. The enum is fixed; "custom" is the escape

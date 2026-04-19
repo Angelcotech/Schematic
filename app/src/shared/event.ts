@@ -51,4 +51,13 @@ export type SchematicEvent =
       workspace_id: string;
       canvas_id: string;
       timestamp: number;
+    }
+  | {
+      // Fires whenever a canvas's nodes/edges change (not metadata — use
+      // canvas.updated for that). Browser debounces and re-fetches the
+      // canvas so CC's incremental add_node/add_edge calls surface live.
+      type: "canvas.content_changed";
+      workspace_id: string;
+      canvas_id: string;
+      timestamp: number;
     };

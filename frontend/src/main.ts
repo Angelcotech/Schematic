@@ -35,10 +35,9 @@ import {
   type ViewportState,
 } from "./webgl/viewport.js";
 import {
-  buildNodeBuffers,
-  destroyNodeBuffers,
-  nodeDraws,
-  type NodeBuffers,
+  drawNodes2D,
+  LEGEND_LANGUAGES,
+  LEGEND_HALO,
 } from "./graph/node-renderer.js";
 import {
   drawEdges2D,
@@ -46,7 +45,6 @@ import {
   LEGEND_EDGE_KINDS,
 } from "./graph/edge-renderer-2d.js";
 import { drawProcessGroups, hitTestProcessGroup } from "./graph/process-renderer.js";
-import { LEGEND_LANGUAGES, LEGEND_HALO } from "./graph/node-renderer.js";
 import { hitTest } from "./graph/hit-test.js";
 import { DaemonWSClient, type ConnectionState } from "./state/ws-client.js";
 
@@ -72,6 +70,7 @@ const closedPanelEl = requireEl<HTMLDivElement>("closed-panel");
 const closedBtn = requireEl<HTMLDivElement>("closed-btn");
 const ccActivityEl = requireEl<HTMLDivElement>("cc-activity");
 const ccActivityText = requireEl<HTMLSpanElement>("cc-activity-text");
+const ctxMenuEl = requireEl<HTMLDivElement>("ctx-menu");
 
 const ctx = initGL(canvas);
 const overlay = createOverlay(container);
@@ -132,8 +131,6 @@ let viewport: ViewportState = {
   xMin: -10, xMax: 10, yMin: -10, yMax: 10,
   width: canvas.clientWidth, height: canvas.clientHeight,
 };
-
-let nodeBuffers: NodeBuffers = buildNodeBuffers(ctx, []);
 
 let cursorPx = -1;
 let cursorPy = -1;
@@ -239,30 +236,24 @@ function renderAll(): void {
   const renderNodes = app.nodes.map(toRenderNode);
   const renderEdges = app.edges.map(toRenderEdge);
 
-  destroyNodeBuffers(ctx, nodeBuffers);
-  nodeBuffers = buildNodeBuffers(ctx, renderNodes);
-  render(ctx, viewport, nodeDraws(ctx, nodeBuffers));
+  // WebGL canvas just provides the cleared background now; all drawing
+  // happens in the 2D overlay above it. Render with empty draws so the
+  // WebGL clear color (matched to the page bg) still paints each frame.
+  render(ctx, viewport, []);
 
   clearOverlay(overlay);
   const c2d = overlay.ctx;
 
-  // Process groups first — they're a subtle backdrop; edges and nodes
-  // paint over them cleanly.
+  // Process groups first — subtle backdrop behind everything else.
   drawProcessGroups(c2d, viewport, app.nodes);
 
-  // Edges next so labels and halos paint on top.
+  // Edges next so the node fills paint on top of them, which naturally
+  // replaces the old clearRect node-mask trick: rounded nodes cover any
+  // edge that routes through their rect.
   drawEdges2D(c2d, viewport, renderEdges, renderNodes);
 
-  // Mask: punch transparent holes at every node's bounding box so any
-  // edge that routes through a box visually disappears inside it — the
-  // WebGL node fill (below the overlay) shows through cleanly. Cheaper
-  // than real obstacle avoidance and gets the same visual result:
-  // wires appear to run behind boxes, never across their labels.
-  for (const cn of app.nodes) {
-    const tl = dataToPixel(viewport, cn.x, cn.y + cn.height);
-    const br = dataToPixel(viewport, cn.x + cn.width, cn.y);
-    c2d.clearRect(tl.px, tl.py, br.px - tl.px, br.py - tl.py);
-  }
+  // Nodes with rounded corners, language accent strip, halo, and border.
+  drawNodes2D(c2d, viewport, renderNodes);
 
   drawStatusLine(c2d);
   drawNodeLabels(c2d);
@@ -299,9 +290,21 @@ function drawNodeLabels(c2d: CanvasRenderingContext2D): void {
     const wPx = br.px - tl.px;
     const hPx = br.py - tl.py;
     if (hPx < 10) continue; // too small to read
-    const fontSize = Math.min(Math.max(hPx * 0.38, 10), 22);
+    // Size the label to fit comfortably inside the node box. Height sets
+    // an upper bound (don't fill more than ~55% vertically), and we also
+    // clamp against width so a short node with a long filename doesn't
+    // get a huge font that just gets truncated. Hard cap at 13px keeps
+    // the diagram feeling compact rather than blown-up.
+    const byHeight = hPx * 0.55;
+    const byWidth = Math.max(8, wPx / 7);
+    const fontSize = Math.min(byHeight, byWidth, 13);
+    // Fade the label as it shrinks toward illegibility — full alpha at 8px+,
+    // linearly transparent between 4 and 8, fully skipped under 4. Keeps
+    // labels from popping off as you zoom out; they dissolve smoothly.
+    if (fontSize < 4) continue;
+    const alpha = 0.95 * Math.min(1, Math.max(0, (fontSize - 4) / 4));
     c2d.font = `${fontSize}px -apple-system, BlinkMacSystemFont, sans-serif`;
-    c2d.fillStyle = "rgba(240, 240, 240, 0.95)";
+    c2d.fillStyle = `rgba(240, 240, 240, ${alpha.toFixed(3)})`;
     const name = cn.file_path.slice(cn.file_path.lastIndexOf("/") + 1);
     const label = truncateToWidth(c2d, name, wPx - 12);
     c2d.fillText(label, (tl.px + br.px) / 2, (tl.py + br.py) / 2);
@@ -532,22 +535,69 @@ function renderClosedPanel(): void {
     closedPanelEl.innerHTML = `<div class="empty">No closed tabs.</div>`;
     return;
   }
-  // Most-recently-updated first — the most intuitive ordering for
-  // "recently closed" even though we store closed state as a flag rather
-  // than a timestamp.
+  // Most-recently-updated first — intuitive for "recently closed" even
+  // though we store closed state as a flag rather than a timestamp.
   const sorted = [...hidden].sort((a, b) => b.updated_at - a.updated_at);
   closedPanelEl.innerHTML = sorted
     .map((c) => `
       <div class="item" data-cid="${c.id}">
         <span>${escapeHtml(c.name)}</span>
-        <span class="reopen">reopen</span>
+        <span class="right">
+          <span class="reopen">reopen</span>
+          <span class="delete-btn" data-cid-delete="${c.id}" title="Delete permanently">×</span>
+        </span>
       </div>`)
     .join("");
   for (const el of closedPanelEl.querySelectorAll<HTMLDivElement>(".item")) {
     const cid = el.getAttribute("data-cid");
     if (!cid) continue;
-    el.addEventListener("click", () => void reopenCanvas(cid));
+    el.addEventListener("click", (e) => {
+      // If the click landed on the delete button, skip the reopen handler.
+      const target = e.target as HTMLElement;
+      if (target.classList.contains("delete-btn")) return;
+      void reopenCanvas(cid);
+    });
   }
+  for (const delEl of closedPanelEl.querySelectorAll<HTMLSpanElement>(".delete-btn")) {
+    const cid = delEl.getAttribute("data-cid-delete");
+    if (!cid) continue;
+    delEl.addEventListener("click", (e) => {
+      e.stopPropagation();
+      void deleteCanvas(cid);
+    });
+  }
+}
+
+async function deleteCanvas(canvasId: string): Promise<void> {
+  if (!app.activeWorkspaceId) return;
+  const cv = app.canvases.find((c) => c.id === canvasId);
+  if (!cv) return;
+  const ok = window.confirm(
+    `Delete "${cv.name}" permanently? This removes the canvas and all its nodes and edges. Can't be undone.`,
+  );
+  if (!ok) return;
+
+  try {
+    const r = await fetch(
+      `${DAEMON_ORIGIN}/workspaces/${app.activeWorkspaceId}/canvases/${canvasId}`,
+      { method: "DELETE" },
+    );
+    if (!r.ok) {
+      showToast("Delete failed.");
+      return;
+    }
+  } catch {
+    showToast("Delete failed (network error).");
+    return;
+  }
+
+  // Canvas.deleted event from the daemon will also fire and run its own
+  // handler, but removing locally here keeps the Closed panel responsive.
+  app.canvases = app.canvases.filter((c) => c.id !== canvasId);
+  renderClosedPanel();
+  renderTabs();
+  updateEmptyState();
+  showToast(`Deleted "${cv.name}".`);
 }
 
 function setClosedPanelOpen(open: boolean): void {
@@ -618,6 +668,415 @@ function renderCCActivity(): void {
 // even when no new hooks arrive. Cheap — just toggles a class and updates
 // the tooltip string; no render loop involved.
 window.setInterval(renderCCActivity, 1000);
+
+// --- Context menu (right-click) ---------------------------------------
+// Runs pre-fetched Schematic queries and copies a Claude-ready prompt to
+// the clipboard — the user pastes into whichever CC session they want to
+// answer. Paste (rather than auto-inject) is deliberate: with multiple CC
+// sessions open, auto-injecting into "the next session that prompts" is
+// a minefield. Explicit paste = deterministic delivery.
+
+interface CtxMenuItem {
+  label: string;
+  hint?: string;
+  action: () => Promise<void> | void;
+}
+
+function renderCtxMenu(x: number, y: number, header: string, items: CtxMenuItem[]): void {
+  const parts: string[] = [];
+  parts.push(`<div class="header">${escapeHtml(header)}</div>`);
+  for (const it of items) {
+    parts.push(`
+      <div class="item">
+        <span>${escapeHtml(it.label)}</span>
+        ${it.hint ? `<span class="hint">${escapeHtml(it.hint)}</span>` : ""}
+      </div>`);
+  }
+  ctxMenuEl.innerHTML = parts.join("");
+  // Wire clicks after innerHTML overwrites.
+  const itemEls = ctxMenuEl.querySelectorAll<HTMLDivElement>(".item");
+  items.forEach((it, i) => {
+    const el = itemEls[i];
+    if (!el) return;
+    el.addEventListener("click", () => {
+      closeCtxMenu();
+      void Promise.resolve(it.action()).catch((e) => {
+        console.error("[schematic] context-menu action failed:", e);
+        showToast("Action failed. Check the console.");
+      });
+    });
+  });
+
+  // Position, then nudge back on-screen if off the right/bottom edge.
+  ctxMenuEl.style.left = `${x}px`;
+  ctxMenuEl.style.top = `${y}px`;
+  ctxMenuEl.style.display = "block";
+  const r = ctxMenuEl.getBoundingClientRect();
+  if (r.right > window.innerWidth - 4) {
+    ctxMenuEl.style.left = `${window.innerWidth - r.width - 4}px`;
+  }
+  if (r.bottom > window.innerHeight - 4) {
+    ctxMenuEl.style.top = `${window.innerHeight - r.height - 4}px`;
+  }
+}
+
+function closeCtxMenu(): void {
+  ctxMenuEl.style.display = "none";
+}
+
+document.addEventListener("click", (e) => {
+  if (ctxMenuEl.style.display === "none") return;
+  if (ctxMenuEl.contains(e.target as Node)) return;
+  closeCtxMenu();
+});
+document.addEventListener("keydown", (e) => {
+  if (e.key === "Escape") closeCtxMenu();
+});
+
+canvas.addEventListener("contextmenu", (e) => {
+  e.preventDefault();
+  const rect = canvas.getBoundingClientRect();
+  const px = e.clientX - rect.left;
+  const py = e.clientY - rect.top;
+  const hitNode = hitTestVisible(px, py);
+  if (hitNode) {
+    openNodeMenu(e.clientX, e.clientY, hitNode);
+    return;
+  }
+  const hitGroup = hitTestProcessGroup(overlay.ctx, viewport, app.nodes, px, py);
+  if (hitGroup) {
+    openProcessMenu(e.clientX, e.clientY, hitGroup.process, hitGroup.memberIds);
+    return;
+  }
+  openCanvasMenu(e.clientX, e.clientY);
+});
+
+// --- Node right-click --------------------------------------------------
+
+function openNodeMenu(x: number, y: number, node: CanvasNode): void {
+  const ws = app.workspaces.find((w) => w.id === app.activeWorkspaceId);
+  if (!ws) return;
+  const shortPath = node.file_path.slice(node.file_path.lastIndexOf("/") + 1);
+  renderCtxMenu(x, y, shortPath, [
+    {
+      label: "Copy 'Blast radius' prompt",
+      hint: "impact",
+      action: () => runBlastRadius(ws.id, node),
+    },
+    {
+      label: "Copy 'Explain this file' prompt",
+      hint: "explain",
+      action: () => runExplainFile(node),
+    },
+    {
+      label: "Create canvas centered on this file",
+      hint: "new canvas",
+      action: () => runCreateCanvasForNode(ws.id, node),
+    },
+  ]);
+}
+
+async function runBlastRadius(workspaceId: string, node: CanvasNode): Promise<void> {
+  const report = await fetchJSON<unknown>(
+    `/workspaces/${workspaceId}/impact?file_path=${encodeURIComponent(node.file_path)}`,
+  );
+  const prompt = [
+    `The user wants to understand the blast radius of modifying this file before making changes.`,
+    ``,
+    `File: ${node.file_path}`,
+    ``,
+    `Schematic has pre-computed the impact report across every canvas in this workspace:`,
+    ``,
+    "```json",
+    JSON.stringify(report, null, 2),
+    "```",
+    ``,
+    `Based on this data, summarize:`,
+    `1. What each instance's role is (which canvas, which process)`,
+    `2. What files are directly connected (incoming + outgoing)`,
+    `3. What would be at risk if this file changed`,
+    `4. Whether it's a high-degree hub that warrants extra care`,
+    ``,
+    `Then ask the user what change they want to make.`,
+  ].join("\n");
+  await copyPromptAndToast(prompt, "Blast radius prompt copied.");
+}
+
+async function runCreateCanvasForNode(workspaceId: string, node: CanvasNode): Promise<void> {
+  const baseName = node.file_path.slice(node.file_path.lastIndexOf("/") + 1);
+  const canvasName = `${baseName} — connections`;
+  const report = await fetchJSON<unknown>(
+    `/workspaces/${workspaceId}/impact?file_path=${encodeURIComponent(node.file_path)}`,
+  );
+  const prompt = [
+    `Populate the Schematic canvas I just created, centered on a single file.`,
+    ``,
+    `Canvas id: <CANVAS_ID>`,
+    `Center file: ${node.file_path}`,
+    ``,
+    `Schematic pre-fetched the impact report (every canvas instance of this file and what it connects to):`,
+    ``,
+    "```json",
+    JSON.stringify(report, null, 2),
+    "```",
+    ``,
+    `Steps:`,
+    `1. Add a node for ${node.file_path} near the center (x ~0, y ~0).`,
+    `2. Read the file to verify its real dependencies and dependents.`,
+    `3. Add nodes for the files it actually connects to. Use the JSON as a starting hint, but trust the code.`,
+    `4. Arrange spatially: incoming dependents to the left of the center, outgoing targets to the right.`,
+    `5. Add edges with short relationship labels ("loads", "authenticates via", "writes to").`,
+    `6. Group files with the \`process\` argument if natural clusters emerge.`,
+    ``,
+    `If this file turns out to have trivial connections (one or two imports, a simple utility with no architectural role), say so and suggest the user delete this empty canvas via the Closed tabs menu instead of populating it.`,
+  ].join("\n");
+  await createCanvasWithPrompt(
+    workspaceId,
+    canvasName,
+    `Centered on ${node.file_path}`,
+    prompt,
+    "Canvas created. Prompt copied.",
+  );
+}
+
+async function runExplainFile(node: CanvasNode): Promise<void> {
+  const prompt = [
+    `The user wants you to explain this file.`,
+    ``,
+    `File: ${node.file_path}`,
+    node.process ? `Process: ${node.process}` : "",
+    ``,
+    `Read the file, then summarize:`,
+    `1. What it does`,
+    `2. What it exports and to whom`,
+    `3. What it depends on`,
+    `4. Any notable invariants or gotchas you notice`,
+  ].filter(Boolean).join("\n");
+  await copyPromptAndToast(prompt, "Explain prompt copied.");
+}
+
+// --- Process container right-click -------------------------------------
+
+function openProcessMenu(x: number, y: number, process: string, memberIds: string[]): void {
+  const ws = app.workspaces.find((w) => w.id === app.activeWorkspaceId);
+  if (!ws) return;
+  renderCtxMenu(x, y, `process: ${process}`, [
+    {
+      label: "Copy 'Audit this group' prompt",
+      hint: "audit",
+      action: () => runAuditProcess(ws.id, process, memberIds),
+    },
+    {
+      label: "Extract this process to its own canvas",
+      hint: "new canvas",
+      action: () => runExtractProcess(ws.id, process, memberIds),
+    },
+  ]);
+}
+
+async function runExtractProcess(
+  workspaceId: string, process: string, memberIds: string[],
+): Promise<void> {
+  const memberFiles = memberIds
+    .map((id) => app.nodes.find((n) => n.id === id)?.file_path)
+    .filter((fp): fp is string => typeof fp === "string");
+  const canvasName = `${process}`;
+  const prompt = [
+    `Populate the Schematic canvas I just created — a focused view of the "${process}" process.`,
+    ``,
+    `Canvas id: <CANVAS_ID>`,
+    `Process: ${process}`,
+    ``,
+    `Members (from the source canvas):`,
+    ...memberFiles.map((f) => `- ${f}`),
+    ``,
+    `Steps:`,
+    `1. Add a node for each member file above. Tag each with \`process: "${process}"\` so they render grouped.`,
+    `2. Read each file to understand how they actually work together.`,
+    `3. Add edges for the internal relationships that make this process cohesive — use short labels ("invokes", "reads", "writes to").`,
+    `4. Arrange spatially by data flow (inputs on the left, outputs on the right).`,
+    `5. If any of these files connect strongly to files OUTSIDE this process, also add those external files as reference nodes (no process label) and draw the boundary edges. Gives the user the context of how this process talks to the rest of the system.`,
+    ``,
+    `If the member list is a grab-bag of unrelated files with no real internal wiring, say so — don't force edges that aren't in the code.`,
+  ].join("\n");
+  await createCanvasWithPrompt(
+    workspaceId,
+    canvasName,
+    `Extracted from process "${process}"`,
+    prompt,
+    "Canvas created. Prompt copied.",
+  );
+}
+
+async function runAuditProcess(
+  workspaceId: string, process: string, memberIds: string[],
+): Promise<void> {
+  if (!app.activeCanvasId) return;
+  const raw = await fetchJSON<{
+    canvas_name: string;
+    missing: Array<{ node_id: string; file_path: string }>;
+    existing: Array<{ node_id: string; file_path: string }>;
+    duplicates: Array<{ file_path: string; node_ids: string[] }>;
+  }>(
+    `/workspaces/${workspaceId}/canvases/${app.activeCanvasId}/audit`,
+  );
+  const memberSet = new Set(memberIds);
+  // Filter audit to the process's member set so CC sees only the group.
+  const filtered = {
+    canvas_name: raw.canvas_name,
+    process,
+    missing: raw.missing.filter((m) => memberSet.has(m.node_id)),
+    existing: raw.existing.filter((e) => memberSet.has(e.node_id)),
+    duplicates: raw.duplicates
+      .map((d) => ({
+        file_path: d.file_path,
+        node_ids: d.node_ids.filter((id) => memberSet.has(id)),
+      }))
+      .filter((d) => d.node_ids.length > 1),
+  };
+  const prompt = [
+    `The user wants to audit the "${process}" process group on the "${raw.canvas_name}" canvas.`,
+    ``,
+    `Here's the drift report, filtered to that process's member nodes:`,
+    ``,
+    "```json",
+    JSON.stringify(filtered, null, 2),
+    "```",
+    ``,
+    `Summarize what's healthy, what's stale (files missing from disk), and any duplicate file instances worth flagging. Propose fixes if any nodes should be removed, renamed, or rewired.`,
+  ].join("\n");
+  await copyPromptAndToast(prompt, "Group audit prompt copied.");
+}
+
+// --- Empty-canvas right-click ------------------------------------------
+
+function openCanvasMenu(x: number, y: number): void {
+  const ws = app.workspaces.find((w) => w.id === app.activeWorkspaceId);
+  const cv = app.canvases.find((c) => c.id === app.activeCanvasId);
+  if (!ws || !cv) return;
+  renderCtxMenu(x, y, `canvas: ${cv.name}`, [
+    {
+      label: "Copy 'Audit canvas' prompt",
+      hint: "drift",
+      action: () => runAuditCanvas(ws.id, cv.id, cv.name),
+    },
+    {
+      label: "Copy 'Find hubs' prompt",
+      hint: "keystones",
+      action: () => runFindHubs(ws.id, cv.id, cv.name),
+    },
+    {
+      label: "Copy 'Find orphans' prompt",
+      hint: "cleanup",
+      action: () => runFindOrphans(ws.id, cv.id, cv.name),
+    },
+    {
+      label: "Copy 'Find cycles' prompt",
+      hint: "smells",
+      action: () => runFindCycles(ws.id, cv.id, cv.name),
+    },
+  ]);
+}
+
+async function runAuditCanvas(wid: string, cid: string, cname: string): Promise<void> {
+  const report = await fetchJSON<unknown>(`/workspaces/${wid}/canvases/${cid}/audit`);
+  const prompt = [
+    `The user wants a drift audit of the "${cname}" Schematic canvas.`,
+    ``,
+    "```json",
+    JSON.stringify(report, null, 2),
+    "```",
+    ``,
+    `Summarize health: node count, stale count (missing from disk), duplicates. If anything looks wrong, propose fixes.`,
+  ].join("\n");
+  await copyPromptAndToast(prompt, "Canvas audit prompt copied.");
+}
+
+async function runFindHubs(wid: string, cid: string, cname: string): Promise<void> {
+  const report = await fetchJSON<unknown>(`/workspaces/${wid}/canvases/${cid}/hubs?min_degree=2`);
+  const prompt = [
+    `The user wants to identify the keystone files on the "${cname}" canvas — high-degree nodes that warrant care when refactoring.`,
+    ``,
+    "```json",
+    JSON.stringify(report, null, 2),
+    "```",
+    ``,
+    `Rank the hubs by total degree, briefly explain what role each plays (read the file if helpful), and flag any that look architecturally risky (e.g. one file doing too many roles).`,
+  ].join("\n");
+  await copyPromptAndToast(prompt, "Hubs prompt copied.");
+}
+
+async function runFindOrphans(wid: string, cid: string, cname: string): Promise<void> {
+  const report = await fetchJSON<unknown>(`/workspaces/${wid}/canvases/${cid}/orphans`);
+  const prompt = [
+    `The user wants to clean up orphan nodes (zero edges) on the "${cname}" canvas.`,
+    ``,
+    "```json",
+    JSON.stringify(report, null, 2),
+    "```",
+    ``,
+    `For each orphan, read the file and decide: is this a forgotten dependency that should be wired up, or a placeholder that can be removed? Propose specific edges to add (add_edge) or nodes to delete (delete_node). Ask the user to confirm before making changes.`,
+  ].join("\n");
+  await copyPromptAndToast(prompt, "Orphans prompt copied.");
+}
+
+async function runFindCycles(wid: string, cid: string, cname: string): Promise<void> {
+  const report = await fetchJSON<unknown>(`/workspaces/${wid}/canvases/${cid}/cycles`);
+  const prompt = [
+    `The user wants to know if the "${cname}" canvas has circular dependencies.`,
+    ``,
+    "```json",
+    JSON.stringify(report, null, 2),
+    "```",
+    ``,
+    `For each cycle found (if any), explain what it means in plain terms and suggest which edge to break — i.e. which file should own the relationship, and which dependency is more naturally the other way around. If no cycles, confirm that and move on.`,
+  ].join("\n");
+  await copyPromptAndToast(prompt, "Cycles prompt copied.");
+}
+
+// --- Shared: copy + toast ----------------------------------------------
+
+async function copyPromptAndToast(prompt: string, label: string): Promise<void> {
+  try {
+    await navigator.clipboard.writeText(prompt);
+    showToast(`${label} Paste into Claude Code.`);
+  } catch {
+    showToast("Clipboard blocked; prompt logged to console.");
+    console.log("[schematic] prompt:\n" + prompt);
+  }
+}
+
+// Creates a new canvas on the server, builds a prompt referencing it,
+// copies to clipboard, and switches the view to it. Prompts use the
+// literal string "<CANVAS_ID>" as a placeholder which is replaced with
+// the real id after creation — so the prompt body can be built before
+// the canvas exists.
+async function createCanvasWithPrompt(
+  workspaceId: string,
+  canvasName: string,
+  description: string | undefined,
+  promptTemplate: string,
+  toastLabel: string,
+): Promise<void> {
+  const body: { name: string; description?: string } = { name: canvasName };
+  if (description) body.description = description;
+  const r = await fetch(
+    `${DAEMON_ORIGIN}/workspaces/${workspaceId}/canvases`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    },
+  );
+  if (!r.ok) {
+    showToast("Canvas creation failed.");
+    return;
+  }
+  const file = (await r.json()) as { canvas: Canvas };
+  const prompt = promptTemplate.replace("<CANVAS_ID>", file.canvas.id);
+  await copyPromptAndToast(prompt, toastLabel);
+  await switchCanvas(file.canvas.id);
+}
 
 // --- Create-canvas modal ------------------------------------------------
 // Replaces the old window.prompt. Collects a canvas name + a description
@@ -794,6 +1253,36 @@ async function switchCanvas(canvasId: string): Promise<void> {
   requestFrame();
 }
 
+// Refresh only the nodes/edges of the currently-active canvas. Unlike
+// switchCanvas this preserves the user's viewport, selection, and
+// active-canvas id — used when CC is authoring and the daemon fires
+// canvas.content_changed events. Debounced so a burst of 20 add_node
+// calls triggers one re-fetch instead of 20.
+let canvasRefreshTimer: number | null = null;
+function scheduleCanvasRefresh(canvasId: string): void {
+  if (canvasRefreshTimer !== null) clearTimeout(canvasRefreshTimer);
+  canvasRefreshTimer = window.setTimeout(() => {
+    canvasRefreshTimer = null;
+    void refreshCanvasContent(canvasId);
+  }, 200);
+}
+
+async function refreshCanvasContent(canvasId: string): Promise<void> {
+  if (!app.activeWorkspaceId || app.activeCanvasId !== canvasId) return;
+  const file = await fetchJSON<{ canvas: Canvas; nodes: CanvasNode[]; edges: CanvasEdge[] }>(
+    `/workspaces/${app.activeWorkspaceId}/canvases/${canvasId}`,
+  );
+  // Only replace content — keep viewport, selection, hover state.
+  app.nodes = file.nodes;
+  app.edges = file.edges;
+  // Drop any stale selected ids that no longer exist on the canvas.
+  const liveIds = new Set(file.nodes.map((n) => n.id));
+  for (const id of Array.from(app.selectedNodeIds)) {
+    if (!liveIds.has(id)) app.selectedNodeIds.delete(id);
+  }
+  requestFrame();
+}
+
 function fitToNodes(): void {
   if (app.nodes.length === 0) {
     viewport = { ...viewport, xMin: -10, xMax: 10, yMin: -10, yMax: 10 };
@@ -904,20 +1393,18 @@ window.addEventListener("mouseup", (e) => {
   drag = null;
   canvas.style.cursor = "default";
   if (!didDrag) {
-    // Click without drag = selection update. Shift-click toggles membership;
-    // plain click replaces the selection with the hit node (or clears it).
+    // Click without drag = selection toggle. Selection exists only to let
+    // the user pick multiple nodes and drag them together — every click on
+    // a node toggles it in/out of the set, and clicking empty space clears.
     const rect = canvas.getBoundingClientRect();
     const px = e.clientX - rect.left;
     const py = e.clientY - rect.top;
     const hit = hitTestVisible(px, py);
-    if (e.shiftKey) {
-      if (hit) {
-        if (app.selectedNodeIds.has(hit.id)) app.selectedNodeIds.delete(hit.id);
-        else app.selectedNodeIds.add(hit.id);
-      }
+    if (hit) {
+      if (app.selectedNodeIds.has(hit.id)) app.selectedNodeIds.delete(hit.id);
+      else app.selectedNodeIds.add(hit.id);
     } else {
       app.selectedNodeIds.clear();
-      if (hit) app.selectedNodeIds.add(hit.id);
     }
     requestFrame();
     return;
@@ -1086,6 +1573,12 @@ async function bootstrap(): Promise<void> {
         if (event.workspace_id !== app.activeWorkspaceId) return;
         app.canvases = app.canvases.map((c) => (c.id === event.canvas.id ? event.canvas : c));
         renderTabs();
+        return;
+      }
+      if (event.type === "canvas.content_changed") {
+        if (event.workspace_id !== app.activeWorkspaceId) return;
+        if (event.canvas_id !== app.activeCanvasId) return;
+        scheduleCanvasRefresh(event.canvas_id);
         return;
       }
       if (event.type === "canvas.deleted") {

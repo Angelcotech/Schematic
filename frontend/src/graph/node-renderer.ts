@@ -1,265 +1,180 @@
-// Node rendering: builds GPU buffers for node fills, halos, and selection
-// borders. Three passes so halos sit behind fills and borders sit on top.
-//
-// Each pass is a plain triangle mesh: 6 vertices per rectangle, each vertex
-// carrying (x, y, r, g, b, a). No instancing yet — Stage 2 is simple on
-// purpose and ~10k vertices easily hits 60fps.
+// 2D node rendering. Replaced the original WebGL triangle-mesh approach
+// in favor of Canvas 2D so rounded corners, accent pills, and other
+// smooth geometry land naturally (arcTo / roundRect vs triangle math).
+// Node counts at Schematic-scale are small enough that 2D easily hits
+// 60fps; the former WebGL buffer/VAO gymnastics bought us nothing.
 
 import type { AiIntent, Health, NodeState } from "@shared/index.js";
-import type { GLContext } from "../webgl/renderer.js";
+import { dataToPixel, type ViewportState } from "../webgl/viewport.js";
 
-interface Rect {
-  x: number; y: number; w: number; h: number;
-  r: number; g: number; b: number; a: number;
-}
+// --- Color palette (curated; no theme toggles per "curated smooth") -------
 
-export interface NodeBuffers {
-  halo: GPUMesh | null;
-  fill: GPUMesh;
-  border: GPUMesh | null;
-}
+// Muted slate for file nodes. Language comes through a thin accent pill
+// on the left, not via the fill, so edges and process groups stay the
+// primary architecture signal.
+const FILE_FILL = "rgb(51, 51, 56)";
+const FILE_FILL_RGB = { r: 0.20, g: 0.20, b: 0.22 };
 
-interface GPUMesh {
-  vao: WebGLVertexArrayObject;
-  count: number;
-}
-
-// --- Color palette (curated; no theme toggles per the "curated smooth" rule) ---
-
-const MODULE_FILL = { r: 0.11, g: 0.11, b: 0.11, a: 1.0 };
-const MODULE_BORDER = { r: 0.22, g: 0.22, b: 0.22, a: 1.0 };
-
-// Muted slate for every file node — language is communicated via a thin
-// accent strip on the left side, not the full fill. Demotes nodes visually
-// so processes and edges read as the primary architecture signal.
-const FILE_FILL = { r: 0.20, g: 0.20, b: 0.22, a: 1.0 };
-
-// Language-accent strip colors (4% of node width, left side).
-const LANGUAGE_ACCENT: Record<string, { r: number; g: number; b: number }> = {
-  ts: { r: 0.19, g: 0.47, b: 0.78 },
-  tsx: { r: 0.19, g: 0.47, b: 0.78 },
-  js: { r: 0.90, g: 0.76, b: 0.23 },
-  jsx: { r: 0.90, g: 0.76, b: 0.23 },
-  py: { r: 0.24, g: 0.55, b: 0.57 },
-  rs: { r: 0.81, g: 0.47, b: 0.29 },
-  go: { r: 0.36, g: 0.70, b: 0.83 },
+// Accent-pill color per language (CSS rgb strings for direct 2D draw).
+const LANGUAGE_ACCENT: Record<string, string> = {
+  ts:  "rgb(48, 120, 199)",
+  tsx: "rgb(48, 120, 199)",
+  js:  "rgb(230, 194, 59)",
+  jsx: "rgb(230, 194, 59)",
+  py:  "rgb(61, 140, 145)",
+  rs:  "rgb(207, 120, 74)",
+  go:  "rgb(92, 179, 212)",
 };
-const DEFAULT_ACCENT = { r: 0.40, g: 0.40, b: 0.40 };
+const DEFAULT_ACCENT = "rgb(102, 102, 102)";
 
-const HALO_BY_INTENT: Record<AiIntent, { r: number; g: number; b: number; a: number } | null> = {
-  idle: null,
-  reading: { r: 0.30, g: 0.65, b: 0.95, a: 0.85 },
-  planning: { r: 0.98, g: 0.82, b: 0.18, a: 0.90 },
-  modified: { r: 0.30, g: 0.88, b: 0.30, a: 0.90 },
-  failed: { r: 0.95, g: 0.55, b: 0.15, a: 0.90 },
-  deleted: { r: 0.95, g: 0.25, b: 0.25, a: 0.90 },
+// Halo tint per ai_intent. Painted as a slightly larger, translucent
+// rounded rect behind the node.
+const HALO_BY_INTENT: Record<AiIntent, { rgba: string } | null> = {
+  idle:     null,
+  reading:  { rgba: "rgba(77, 166, 242, 0.75)" },
+  planning: { rgba: "rgba(250, 209, 46, 0.85)" },
+  modified: { rgba: "rgba(77, 224, 77, 0.85)" },
+  failed:   { rgba: "rgba(242, 140, 38, 0.85)" },
+  deleted:  { rgba: "rgba(242, 64, 64, 0.85)" },
 };
 
-// CSS-ready color reference for the legend UI. Re-exports the same RGB
-// values the WebGL shader uses so the legend always matches what you see.
-function rgbCss(c: { r: number; g: number; b: number }): string {
-  return `rgb(${Math.round(c.r * 255)}, ${Math.round(c.g * 255)}, ${Math.round(c.b * 255)})`;
+const HEALTH_BORDER: Record<Health, string | null> = {
+  ok:      null,
+  warning: "rgba(230, 153, 51, 1)",
+  error:   "rgba(230, 77, 64, 1)",
+  unknown: null,
+};
+const SELECTION_BORDER = "rgba(255, 255, 255, 0.95)";
+
+// --- Public API -----------------------------------------------------------
+
+export function drawNodes2D(
+  c2d: CanvasRenderingContext2D,
+  viewport: ViewportState,
+  nodes: NodeState[],
+): void {
+  if (nodes.length === 0) return;
+
+  // Two passes so halos sit behind every node, not just the one they
+  // belong to — otherwise one node's halo could get painted over by
+  // another node rendered later in the list.
+  c2d.save();
+
+  // Pass 1: halos (behind).
+  for (const n of nodes) {
+    const intent = n.ai_intent;
+    if (intent === "idle") continue;
+    const halo = HALO_BY_INTENT[intent];
+    if (!halo) continue;
+    const tl = dataToPixel(viewport, n.x, n.y + n.height);
+    const br = dataToPixel(viewport, n.x + n.width, n.y);
+    const w = br.px - tl.px;
+    const h = br.py - tl.py;
+    if (w < 2 || h < 2) continue;
+    const r = cornerRadius(w, h);
+    const pad = 6;
+    roundedRectPath(c2d, tl.px - pad, tl.py - pad, w + pad * 2, h + pad * 2, r + pad);
+    c2d.fillStyle = halo.rgba;
+    c2d.fill();
+  }
+
+  // Pass 2: node body (fill + accent + border).
+  for (const n of nodes) {
+    const tl = dataToPixel(viewport, n.x, n.y + n.height);
+    const br = dataToPixel(viewport, n.x + n.width, n.y);
+    const w = br.px - tl.px;
+    const h = br.py - tl.py;
+    if (w < 2 || h < 2) continue;
+    const r = cornerRadius(w, h);
+
+    // Fill
+    roundedRectPath(c2d, tl.px, tl.py, w, h, r);
+    c2d.fillStyle = FILE_FILL;
+    c2d.fill();
+
+    // Language accent pill on the left.
+    if (n.kind === "file") {
+      const accentColor = n.language ? LANGUAGE_ACCENT[n.language] ?? DEFAULT_ACCENT : DEFAULT_ACCENT;
+      const inset = Math.min(3, h * 0.15);
+      const accentW = Math.max(3, w * 0.04);
+      const accentH = h - inset * 2;
+      if (accentH > 2) {
+        roundedRectPath(
+          c2d,
+          tl.px + inset,
+          tl.py + inset,
+          accentW,
+          accentH,
+          Math.min(2, accentW / 2),
+        );
+        c2d.fillStyle = accentColor;
+        c2d.fill();
+      }
+    }
+
+    // Border — selection beats health; health border surfaces compile
+    // errors/warnings at a glance.
+    const border = borderFor(n);
+    if (border) {
+      roundedRectPath(c2d, tl.px, tl.py, w, h, r);
+      c2d.strokeStyle = border.color;
+      c2d.lineWidth = border.width;
+      c2d.stroke();
+    }
+  }
+
+  c2d.restore();
 }
 
-// Legend entries — grouped by shared color (e.g. .ts and .tsx both blue).
+function borderFor(n: NodeState): { color: string; width: number } | null {
+  if (n.user_state === "selected") return { color: SELECTION_BORDER, width: 2 };
+  const health = HEALTH_BORDER[n.health];
+  if (health) return { color: health, width: 1.5 };
+  return null;
+}
+
+function cornerRadius(wPx: number, hPx: number): number {
+  // Match the "process box" feel — subtle rounding, clamped so small
+  // nodes don't become pills.
+  return Math.min(5, wPx / 3, hPx / 3);
+}
+
+function roundedRectPath(
+  c2d: CanvasRenderingContext2D,
+  x: number, y: number, w: number, h: number, r: number,
+): void {
+  // Guard against radii that exceed half the smaller side (which turns
+  // the path into garbage at tiny zoom).
+  const safeR = Math.max(0, Math.min(r, w / 2, h / 2));
+  c2d.beginPath();
+  c2d.moveTo(x + safeR, y);
+  c2d.lineTo(x + w - safeR, y);
+  c2d.quadraticCurveTo(x + w, y, x + w, y + safeR);
+  c2d.lineTo(x + w, y + h - safeR);
+  c2d.quadraticCurveTo(x + w, y + h, x + w - safeR, y + h);
+  c2d.lineTo(x + safeR, y + h);
+  c2d.quadraticCurveTo(x, y + h, x, y + h - safeR);
+  c2d.lineTo(x, y + safeR);
+  c2d.quadraticCurveTo(x, y, x + safeR, y);
+  c2d.closePath();
+}
+
+// --- Legend exports (used by the toolbar Legend dropdown) -----------------
+
 export const LEGEND_LANGUAGES: Array<{ label: string; color: string }> = [
-  { label: ".ts / .tsx",  color: rgbCss(LANGUAGE_ACCENT.ts) },
-  { label: ".js / .jsx",  color: rgbCss(LANGUAGE_ACCENT.js) },
-  { label: ".py",         color: rgbCss(LANGUAGE_ACCENT.py) },
-  { label: ".rs",         color: rgbCss(LANGUAGE_ACCENT.rs) },
-  { label: ".go",         color: rgbCss(LANGUAGE_ACCENT.go) },
-  { label: "other",       color: rgbCss(DEFAULT_ACCENT) },
+  { label: ".ts / .tsx",  color: LANGUAGE_ACCENT.ts },
+  { label: ".js / .jsx",  color: LANGUAGE_ACCENT.js },
+  { label: ".py",         color: LANGUAGE_ACCENT.py },
+  { label: ".rs",         color: LANGUAGE_ACCENT.rs },
+  { label: ".go",         color: LANGUAGE_ACCENT.go },
+  { label: "other",       color: DEFAULT_ACCENT },
 ];
 
 export const LEGEND_HALO: Array<{ label: string; color: string }> =
-  (Object.entries(HALO_BY_INTENT) as Array<[AiIntent, { r: number; g: number; b: number; a: number } | null]>)
+  (Object.entries(HALO_BY_INTENT) as Array<[AiIntent, { rgba: string } | null]>)
     .filter(([, c]) => c !== null)
-    .map(([intent, c]) => ({
-      label: intent,
-      color: rgbCss(c as { r: number; g: number; b: number }),
-    }));
+    .map(([intent, c]) => ({ label: intent, color: (c as { rgba: string }).rgba }));
 
-const HEALTH_BORDER: Record<Health, { r: number; g: number; b: number; a: number } | null> = {
-  ok: null,
-  warning: { r: 0.90, g: 0.60, b: 0.20, a: 1.0 },
-  error: { r: 0.90, g: 0.30, b: 0.25, a: 1.0 },
-  unknown: null,
-};
-
-const SELECTION_BORDER = { r: 1.0, g: 1.0, b: 1.0, a: 1.0 };
-
-// Halo padding. Leaves (files, symbols) use a fraction of their larger
-// dimension so small nodes still get a generous attention-grabbing glow.
-// Modules use a fixed absolute thickness so every module's halo reads
-// the same no matter its size — a tall 42-file App module and a short
-// 5-file Root module get the same visible glow ring.
-const HALO_PAD_FRAC_LEAF = 0.22;
-const HALO_PAD_MODULE_ABS = 0.18;
-// Border ring thickness rendered as a frame of quads around the node.
-const BORDER_THICK = 0.04;
-
-// --- Rect → triangle vertex writer ---
-
-function writeRectTriangles(out: number[], r: Rect): void {
-  const { x, y, w, h, r: cr, g: cg, b: cb, a } = r;
-  // Two triangles (0,1,2) and (0,2,3) for rectangle with corners BL, BR, TR, TL.
-  // Rectangle anchor (x, y) is bottom-left.
-  const x0 = x, y0 = y;
-  const x1 = x + w, y1 = y + h;
-  out.push(
-    x0, y0, cr, cg, cb, a,
-    x1, y0, cr, cg, cb, a,
-    x1, y1, cr, cg, cb, a,
-    x0, y0, cr, cg, cb, a,
-    x1, y1, cr, cg, cb, a,
-    x0, y1, cr, cg, cb, a,
-  );
-}
-
-// Writes a hollow rectangle border as four small rects (top, bottom, left, right).
-function writeRectBorder(out: number[], r: Rect, thick: number): void {
-  const { x, y, w, h, r: cr, g: cg, b: cb, a } = r;
-  const c = (px: number, py: number, pw: number, ph: number): Rect => ({ x: px, y: py, w: pw, h: ph, r: cr, g: cg, b: cb, a });
-  writeRectTriangles(out, c(x, y, w, thick));                 // bottom
-  writeRectTriangles(out, c(x, y + h - thick, w, thick));     // top
-  writeRectTriangles(out, c(x, y, thick, h));                 // left
-  writeRectTriangles(out, c(x + w - thick, y, thick, h));     // right
-}
-
-// --- Public API ---
-
-export function buildNodeBuffers(ctx: GLContext, nodes: NodeState[]): NodeBuffers {
-  const haloVerts: number[] = [];
-  const fillVerts: number[] = [];
-  const borderVerts: number[] = [];
-
-  for (const n of nodes) {
-    const fillColor = colorForNode(n);
-
-    // Halo — painted when a file (canvas node) is in a non-idle state.
-    // Module aggregation was a pre-canvas concept; each canvas node is
-    // file-level and has its own ai_intent.
-    const haloIntent: AiIntent | undefined = n.ai_intent !== "idle" ? n.ai_intent : undefined;
-    const halo = haloIntent ? HALO_BY_INTENT[haloIntent] : null;
-    if (halo) {
-      const pad = n.kind === "module"
-        ? HALO_PAD_MODULE_ABS
-        : Math.max(n.width, n.height) * HALO_PAD_FRAC_LEAF;
-      // Modules get a dimmer halo so the aggregate signal doesn't
-      // overwhelm leaf-level halos when zoomed in.
-      const alphaMul = n.kind === "module" ? 0.55 : 1;
-      writeRectTriangles(haloVerts, {
-        x: n.x - pad,
-        y: n.y - pad,
-        w: n.width + pad * 2,
-        h: n.height + pad * 2,
-        r: halo.r, g: halo.g, b: halo.b, a: halo.a * alphaMul,
-      });
-    }
-
-    // Fill — main body (uniform slate for file nodes, module fill for modules).
-    writeRectTriangles(fillVerts, {
-      x: n.x, y: n.y, w: n.width, h: n.height,
-      r: fillColor.r, g: fillColor.g, b: fillColor.b, a: fillColor.a,
-    });
-
-    // Language accent strip on the left side of file nodes. Thin colored
-    // band keyed to file extension — language read at a glance, without
-    // the node fill dominating the whole visual.
-    if (n.kind === "file") {
-      const accent = n.language ? LANGUAGE_ACCENT[n.language] ?? DEFAULT_ACCENT : DEFAULT_ACCENT;
-      const stripW = Math.max(3, n.width * 0.03);
-      writeRectTriangles(fillVerts, {
-        x: n.x, y: n.y, w: stripW, h: n.height,
-        r: accent.r, g: accent.g, b: accent.b, a: 1.0,
-      });
-    }
-
-    // Border: selection wins over health (selection is a loud user signal).
-    // Modules with aggregated errors get a red border as a glance signal.
-    const healthBorder = HEALTH_BORDER[n.health];
-    const aggErr = n.aggregated_health?.error ?? 0;
-    const aggWarn = n.aggregated_health?.warning ?? 0;
-    const moduleAggBorder =
-      n.kind === "module" && aggErr > 0 ? HEALTH_BORDER["error"]
-      : n.kind === "module" && aggWarn > 0 ? HEALTH_BORDER["warning"]
-      : null;
-    if (n.user_state === "selected") {
-      writeRectBorder(borderVerts,
-        { x: n.x, y: n.y, w: n.width, h: n.height, ...SELECTION_BORDER }, BORDER_THICK);
-    } else if (healthBorder) {
-      writeRectBorder(borderVerts,
-        { x: n.x, y: n.y, w: n.width, h: n.height, ...healthBorder }, BORDER_THICK);
-    } else if (moduleAggBorder) {
-      writeRectBorder(borderVerts,
-        { x: n.x, y: n.y, w: n.width, h: n.height, ...moduleAggBorder }, BORDER_THICK * 0.7);
-    } else if (n.kind === "module") {
-      writeRectBorder(borderVerts,
-        { x: n.x, y: n.y, w: n.width, h: n.height, ...MODULE_BORDER }, BORDER_THICK * 0.5);
-    }
-  }
-
-  return {
-    halo: haloVerts.length > 0 ? uploadMesh(ctx, new Float32Array(haloVerts)) : null,
-    fill: uploadMesh(ctx, new Float32Array(fillVerts)),
-    border: borderVerts.length > 0 ? uploadMesh(ctx, new Float32Array(borderVerts)) : null,
-  };
-}
-
-export function destroyNodeBuffers(ctx: GLContext, bufs: NodeBuffers): void {
-  const { gl } = ctx;
-  for (const m of [bufs.halo, bufs.fill, bufs.border]) {
-    if (m) gl.deleteVertexArray(m.vao);
-  }
-}
-
-// Returns the ordered list of draw commands (halo behind, fill middle, border in front).
-export function nodeDraws(ctx: GLContext, bufs: NodeBuffers): { vao: WebGLVertexArrayObject; mode: number; count: number }[] {
-  const { gl } = ctx;
-  const draws: { vao: WebGLVertexArrayObject; mode: number; count: number }[] = [];
-  if (bufs.halo) draws.push({ vao: bufs.halo.vao, mode: gl.TRIANGLES, count: bufs.halo.count });
-  draws.push({ vao: bufs.fill.vao, mode: gl.TRIANGLES, count: bufs.fill.count });
-  if (bufs.border) draws.push({ vao: bufs.border.vao, mode: gl.TRIANGLES, count: bufs.border.count });
-  return draws;
-}
-
-// --- Internal helpers ---
-
-function colorForNode(n: NodeState): { r: number; g: number; b: number; a: number } {
-  if (n.kind === "module") return { ...MODULE_FILL };
-  if (n.kind === "symbol") {
-    switch (n.symbol_kind) {
-      case "function": return { r: 0.30, g: 0.55, b: 0.45, a: 1.0 };
-      case "class": return { r: 0.55, g: 0.40, b: 0.60, a: 1.0 };
-      case "interface": return { r: 0.45, g: 0.45, b: 0.60, a: 1.0 };
-      case "type": return { r: 0.40, g: 0.50, b: 0.55, a: 1.0 };
-      case "constant": return { r: 0.50, g: 0.45, b: 0.35, a: 1.0 };
-      default: return { r: 0.40, g: 0.40, b: 0.40, a: 1.0 };
-    }
-  }
-  // File nodes: uniform muted slate. The language is shown as an accent
-  // strip written separately in buildNodeBuffers, not via the fill.
-  return { ...FILE_FILL };
-}
-
-function uploadMesh(ctx: GLContext, verts: Float32Array): GPUMesh {
-  const { gl, attribs } = ctx;
-  const vao = gl.createVertexArray();
-  if (!vao) throw new Error("[schematic] createVertexArray failed");
-  gl.bindVertexArray(vao);
-
-  const buf = gl.createBuffer();
-  if (!buf) throw new Error("[schematic] createBuffer failed");
-  gl.bindBuffer(gl.ARRAY_BUFFER, buf);
-  gl.bufferData(gl.ARRAY_BUFFER, verts, gl.STATIC_DRAW);
-
-  const STRIDE = 6 * 4; // 6 floats per vertex (x, y, r, g, b, a)
-  gl.enableVertexAttribArray(attribs.a_position);
-  gl.vertexAttribPointer(attribs.a_position, 2, gl.FLOAT, false, STRIDE, 0);
-  gl.enableVertexAttribArray(attribs.a_color);
-  gl.vertexAttribPointer(attribs.a_color, 4, gl.FLOAT, false, STRIDE, 2 * 4);
-
-  gl.bindVertexArray(null);
-  return { vao, count: verts.length / 6 };
-}
-
+// Keep FILE_FILL_RGB exported in case some future renderer wants the 0-1
+// RGB form; no current callers but this is the WebGL-friendly encoding.
+export { FILE_FILL_RGB };

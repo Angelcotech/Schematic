@@ -77,14 +77,33 @@ export function fitToBounds(
   maxY: number,
   paddingFrac = 0.05,
 ): ViewportState {
-  // Minimum padding floor for degenerate bounds (single node, collinear points).
-  const padX = Math.max((maxX - minX) * paddingFrac, 1);
-  const padY = Math.max((maxY - minY) * paddingFrac, 1);
+  // Preserve aspect ratio: expand whichever axis is less constrained so
+  // pixels-per-data-unit match horizontally and vertically. Without this
+  // a wide-but-short canvas (e.g. 1600×300 data) stretches the Y axis to
+  // fill, making nodes render taller than they should.
+  const dataW = Math.max(1, maxX - minX);
+  const dataH = Math.max(1, maxY - minY);
+  const canvasAspect = vp.width / Math.max(1, vp.height);
+  const dataAspect = dataW / dataH;
+
+  const padFactor = 1 + paddingFrac * 2;
+  let width: number, height: number;
+  if (dataAspect > canvasAspect) {
+    // Data is wider than canvas — width fills, height padded to match.
+    width = dataW * padFactor;
+    height = width / canvasAspect;
+  } else {
+    // Data is taller than canvas — height fills, width padded to match.
+    height = dataH * padFactor;
+    width = height * canvasAspect;
+  }
+  const cx = (minX + maxX) / 2;
+  const cy = (minY + maxY) / 2;
   return {
     ...vp,
-    xMin: minX - padX,
-    xMax: maxX + padX,
-    yMin: minY - padY,
-    yMax: maxY + padY,
+    xMin: cx - width / 2,
+    xMax: cx + width / 2,
+    yMin: cy - height / 2,
+    yMax: cy + height / 2,
   };
 }

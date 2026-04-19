@@ -295,7 +295,7 @@ server.tool(
 Arguments:
 - file_path: workspace-relative path, e.g. 'app/src/daemon/http.ts'. Must match the real path on disk; it's how CC edits get mapped back to this box.
 - x, y: bottom-left corner in canvas-space units. Typical ranges 0-2000 horizontally, 0-1500 vertically. Omit both to auto-grid (convenient when laying out many nodes at once).
-- width, height: in canvas-space units. Default 180x50. Bump width up for files with long names.
+- width, height: in canvas-space units. Default 160x36 — compact tab-shape. Stick with the default unless the filename is genuinely long; smaller nodes leave more room for edges and processes to breathe.
 - process: optional grouping label like 'WebGL Chart' or 'G1 Engine'. Nodes with the same process render inside a shared rounded outline with the process name pilled at the top. One process per node — a file that belongs to two processes should be represented as two separate nodes.
 
 Layout guidance: think of the canvas like a Mermaid flow diagram. Arrange nodes so data flows left-to-right or top-to-bottom; keep related files near each other spatially AND via a shared process label. Don't stack files in a single vertical column — it makes edges unreadable.

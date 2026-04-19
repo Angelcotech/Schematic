@@ -100,13 +100,14 @@ import {
 } from "./persist.js";
 
 // Auto-grid placement constants. Used when a node is added without explicit
-// x, y. Matches the existing node renderer's default visual sizes so the
-// grid reads cleanly before any drag-reposition.
+// x, y. Tab-shaped compact defaults — the renderer is built to make small
+// flat nodes read cleanly at zoom, and smaller nodes leave more room for
+// edges and labels to breathe.
 const AUTO_COLS = 5;
-const AUTO_NODE_W = 180;
-const AUTO_NODE_H = 50;
+const AUTO_NODE_W = 160;
+const AUTO_NODE_H = 36;
 const AUTO_GAP_X = 40;
-const AUTO_GAP_Y = 30;
+const AUTO_GAP_Y = 22;
 
 function autoGridPosition(nodeIndex: number): { x: number; y: number } {
   const col = nodeIndex % AUTO_COLS;

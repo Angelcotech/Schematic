@@ -23,7 +23,7 @@ export async function install(): Promise<void> {
   console.log("───────────────────");
 
   await mkdir(hooksDir, { recursive: true });
-  await writeFile(hookScriptPath, generateHookScript(cfg.port), "utf8");
+  await writeFile(hookScriptPath, generateHookScript(), "utf8");
   await chmod(hookScriptPath, 0o755);
   console.log(`✔ hook script written to ${hookScriptPath}`);
 
