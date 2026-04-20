@@ -12,6 +12,7 @@ import type { Workspace } from "../shared/workspace.js";
 import type { WorkspaceRegistry } from "./workspaces/registry.js";
 import type { WSBroadcaster } from "./ws.js";
 import { dirname } from "node:path";
+import { spawn } from "node:child_process";
 import { newWorkspace, route } from "./workspaces/router.js";
 import type { ActivationManager } from "./workspaces/activate.js";
 import type { CanvasStoreRegistry } from "./canvas/store.js";
@@ -281,6 +282,10 @@ export function createRequestHandler(
           { type: "canvas.created", workspace_id: wid, canvas: file.canvas, timestamp: Date.now() },
           wid,
         );
+        // Fire-and-forget: if no browser is connected, open one so the
+        // user sees what CC just built. The spawn is detached; canvas
+        // creation returns immediately regardless of browser state.
+        void ensureBrowserOpen(ctx);
         return json(res, 201, file);
       }
 
@@ -671,6 +676,32 @@ function broadcastContentChanged(
     },
     workspaceId,
   );
+}
+
+// If a canvas was just created and no browser is currently connected,
+// pop one open so the user actually sees what CC built. Only fires on
+// canvas.created (a clear "show me something new" signal) — not on
+// add_node/add_edge/edits, which would be annoying on every mutation.
+// Detached + silent-on-failure so it never blocks the HTTP response.
+async function ensureBrowserOpen(ctx: DaemonContext): Promise<void> {
+  if (ctx.ws.clientCount() > 0) return;
+  const cfg = await readOrInitConfig();
+  const url = `http://localhost:${cfg.port}`;
+  const platform = process.platform;
+  let cmd: string;
+  let args: string[];
+  if (platform === "darwin") {
+    cmd = "open"; args = [url];
+  } else if (platform === "win32") {
+    cmd = "cmd"; args = ["/c", "start", "", url];
+  } else {
+    cmd = "xdg-open"; args = [url];
+  }
+  try {
+    const child = spawn(cmd, args, { detached: true, stdio: "ignore" });
+    child.on("error", () => { /* browser missing/blocked — silent */ });
+    child.unref();
+  } catch { /* silent */ }
 }
 
 // Strict edge-kind validator. The enum is fixed; "custom" is the escape
