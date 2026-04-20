@@ -65,7 +65,8 @@ curl -sS -X POST -H "$MCP_HDR" -H "$JSON_HDR" \
       {"client_id":"b","file_path":"b.ts","x":200,"y":0,"process":"Core"},
       {"client_id":"c","file_path":"c.ts","x":400,"y":0}
     ],
-    "edges":[{"src":"a","dst":"b","kind":"calls"},{"src":"b","dst":"c","kind":"reads"}]
+    "edges":[{"src":"a","dst":"b","kind":"calls"},{"src":"b","dst":"c","kind":"reads"}],
+    "layout":"none"
   }' >/dev/null
 pass "canvas populated with 3 nodes, 2 edges"
 

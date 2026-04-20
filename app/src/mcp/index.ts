@@ -244,6 +244,8 @@ server.tool(
 
 Workflow: create_canvas → bulk_populate with ALL nodes and edges in one call. The user sees the canvas live in their browser at localhost:7777. Do NOT call add_node / add_edge in a loop to build a canvas from scratch — use bulk_populate.
 
+**Do not compute x/y for nodes.** bulk_populate auto-lays-out the canvas with dagre after insert, producing a clean left-to-right data-flow diagram. Spend your effort on meaningful process labels and edge labels instead.
+
 Naming: scope canvases tightly. Prefer "WebGL Pipeline", "Auth Flow", "G1 Engine" over "Full Architecture". Focused diagrams are readable; kitchen-sink diagrams aren't. If the user asks for "the whole repo", consider creating several canvases for different concerns instead.
 
 Coordinate system: canvas-space units, bottom-left origin. Typical canvas is ~2000x1500 units. Default node size is 180x50. Lay out by data flow — inputs on the left, outputs on the right, top-to-bottom for sequences. Group related files spatially AND via the \`process\` argument on add_node so they also render inside a labeled group.
@@ -390,18 +392,21 @@ server.tool(
   "bulk_populate",
   `Populate a canvas with many nodes and edges in a single call. **Use this when building a canvas from scratch** — it's the right tool for the "diagram X" workflow. Avoid calling add_node / add_edge in a loop; one bulk_populate replaces 40+ individual tool calls.
 
+**Do NOT compute x/y coordinates for nodes.** Schematic runs a Sugiyama layered layout over the whole canvas automatically after insert, producing a clean left-to-right data-flow diagram that respects your process groupings. Hand-picked coordinates consistently produce worse results than the auto-layout for canvases with more than a handful of nodes. Just omit x and y.
+
 Arguments:
 - canvas_id: target canvas, from create_canvas.
-- nodes: array of { client_id, file_path, x?, y?, width?, height?, process? }
-    client_id is any short string you invent (e.g. "n1", "n2") to reference this node from the edges array in the same call. File_path is the workspace-relative path.
+- nodes: array of { client_id, file_path, process?, width?, height? }
+    client_id is any short string you invent (e.g. "n1", "n2") to reference this node from the edges array in the same call. file_path is the workspace-relative path. process is a short label for grouping (e.g. "Daemon Core", "MCP"); same-process nodes render in a shared container and are laid out as a cluster.
 - edges: array of { src, dst, label?, kind? }
     src and dst are either a client_id from the nodes array above OR the real id of an existing node (for additive population after the canvas is partially built). kind is one of calls | imports | reads | writes | control | custom.
+- layout: optional. "LR" (default, left-to-right data flow — the right choice for almost everything), "TB" (top-to-bottom, better for deep hierarchies), or "none" (keep caller-supplied x/y, rarely the right call — only use if you have a specific placement plan).
 
 Validation is all-or-nothing. If any edge references an unknown src/dst, the whole call aborts with no partial state written.
 
 Returns: { nodes_created, edges_created }. Node real ids are not returned — for subsequent edits (move_node, delete_node), fetch the canvas with list_canvases + get or pass another bulk_populate with additive intent.
 
-Layout rule still applies: give each node an (x, y) so data flows left-to-right or top-to-bottom; use process labels to group related files.`,
+**What matters for a good canvas:** meaningful process groupings (give every node a process label when the file belongs to a clear subsystem), descriptive edge labels, the right edge kind. Forget about x/y.`,
   {
     canvas_id: z.string(),
     nodes: z.array(
@@ -425,13 +430,16 @@ Layout rule still applies: give each node an (x, y) so data flows left-to-right 
           .optional(),
       }),
     ),
+    layout: z.enum(["LR", "TB", "none"]).optional(),
   },
-  async ({ canvas_id, nodes, edges }) => {
+  async ({ canvas_id, nodes, edges, layout }) => {
     const ws = await sessionWorkspace();
     if (!ws) return daemonDownResponse(NO_FOCUS_MSG);
+    const body: Record<string, unknown> = { nodes, edges };
+    if (layout !== undefined) body.layout = layout;
     const result = await postOrNull<{ nodes_created: number; edges_created: number }>(
       `/workspaces/${ws.id}/canvases/${canvas_id}/bulk`,
-      { nodes, edges },
+      body,
     );
     if (!result) {
       return daemonDownResponse(
@@ -504,24 +512,32 @@ Errors loud: if no nodes match process_name, the call returns an error. Don't ca
 
 server.tool(
   "auto_layout",
-  `Clean up a tangled canvas by running a Sugiyama layered layout (via dagre) over every node and edge. One call replaces dozens of move_node calls for initial placement, and respects process groupings — same-process nodes are kept spatially clustered.
+  `Clean up a tangled canvas by running a Sugiyama layered layout (via dagre) over every node and edge. One call replaces dozens of move_node calls, and respects process groupings — same-process nodes are kept spatially clustered.
+
+Note: bulk_populate already runs this automatically. You only need auto_layout for canvases built before layout-by-default, or when you want to re-flow a canvas after adding or removing many nodes with add_node/add_edge.
 
 Arguments:
 - canvas_id: target canvas.
 - direction: optional. "LR" (default, left-to-right — data-flow style) or "TB" (top-to-bottom — classic org-chart style).
+- nodesep: optional. Pixel gap between sibling nodes in the same rank. Default 80. Raise it (120+) for denser labels; lower (40) to pack tight.
+- ranksep: optional. Pixel gap between ranks (layers). Default 150. Raise it for more edge-label room; lower to tighten vertically.
 
-Behavior: full overwrite. Every node gets a new (x, y). Prior placements are replaced. Edges are considered for routing but their labels/kinds are untouched. The tool is destructive for hand-adjusted positions — use it for initial layout or when a diagram has become unreadable, not for minor tweaks.
+Behavior: full overwrite. Every node gets a new (x, y). Prior placements are replaced. The tool is destructive for hand-adjusted positions — use it for initial layout or when a diagram has become unreadable, not for minor tweaks.
 
 Returns { nodes_laid_out: N }. Errors if the canvas is empty.`,
   {
     canvas_id: z.string(),
     direction: z.enum(["LR", "TB"]).optional(),
+    nodesep: z.number().optional(),
+    ranksep: z.number().optional(),
   },
-  async ({ canvas_id, direction }) => {
+  async ({ canvas_id, direction, nodesep, ranksep }) => {
     const ws = await sessionWorkspace();
     if (!ws) return daemonDownResponse(NO_FOCUS_MSG);
-    const body: { direction?: "LR" | "TB" } = {};
+    const body: Record<string, unknown> = {};
     if (direction !== undefined) body.direction = direction;
+    if (nodesep !== undefined) body.nodesep = nodesep;
+    if (ranksep !== undefined) body.ranksep = ranksep;
     const r = await postOrNull<{ nodes_laid_out: number }>(
       `/workspaces/${ws.id}/canvases/${canvas_id}/auto_layout`,
       body,

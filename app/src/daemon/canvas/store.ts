@@ -126,6 +126,71 @@ function notFound(what: string, id: string): never {
   throw e;
 }
 
+// Default dagre spacing. Intentionally roomy — tight defaults caused
+// overlap and edge snarl on the 40+ node canvases CC produces from
+// "diagram the X repo" prompts. Exposed as overrides on autoLayout for
+// power-user tuning but NOT on bulkPopulate, which keeps the default
+// path dead simple.
+const DAGRE_DEFAULT_NODESEP = 80;
+const DAGRE_DEFAULT_RANKSEP = 150;
+
+// Runs dagre over a CanvasFile's nodes+edges and writes new (x, y) back
+// into each node in place. Mutates `file.nodes`; does NOT write to
+// disk, bump updated_at, or broadcast — the caller owns those. Shared
+// by `autoLayout` (standalone re-layout) and `bulkPopulate` (layout
+// immediately after insert, so there's only ever one file write).
+//
+// Coordinate mapping: dagre uses top-left origin with CENTER-point node
+// coords. Schematic uses bottom-left origin with BOTTOM-LEFT-corner
+// coords. The flip pass converts after dagre.layout() returns.
+function applyDagreLayout(
+  file: CanvasFile,
+  direction: "LR" | "TB",
+  nodesep?: number,
+  ranksep?: number,
+): void {
+  if (file.nodes.length === 0) return;
+
+  const g = new dagre.graphlib.Graph({ compound: true });
+  g.setGraph({
+    rankdir: direction,
+    nodesep: nodesep ?? DAGRE_DEFAULT_NODESEP,
+    ranksep: ranksep ?? DAGRE_DEFAULT_RANKSEP,
+    marginx: 40,
+    marginy: 40,
+  });
+  g.setDefaultEdgeLabel(() => ({}));
+
+  const processes = new Set<string>();
+  for (const n of file.nodes) {
+    g.setNode(n.id, { width: n.width, height: n.height });
+    if (n.process) processes.add(n.process);
+  }
+  for (const p of processes) g.setNode(`cluster_${p}`, {});
+  for (const n of file.nodes) {
+    if (n.process) g.setParent(n.id, `cluster_${n.process}`);
+  }
+  for (const e of file.edges) g.setEdge(e.src, e.dst);
+
+  dagre.layout(g);
+
+  // Dagre's d.y is the node's center in top-left coords. Bottom edge
+  // in top-left space = d.y + d.height/2. Flip to bottom-left by
+  // subtracting from the max bottom value.
+  let maxBottomTopLeft = 0;
+  for (const n of file.nodes) {
+    const d = g.node(n.id);
+    const bottomTL = d.y + d.height / 2;
+    if (bottomTL > maxBottomTopLeft) maxBottomTopLeft = bottomTL;
+  }
+  for (const n of file.nodes) {
+    const d = g.node(n.id);
+    n.x = d.x - n.width / 2;
+    // Bottom-left Y of this node = canvasHeight - (top-left bottom edge).
+    n.y = maxBottomTopLeft - (d.y + n.height / 2);
+  }
+}
+
 export class CanvasStore {
   constructor(
     public readonly workspaceId: string,
@@ -490,6 +555,12 @@ export class CanvasStore {
         label?: string;
         kind?: CanvasEdgeKind;
       }>;
+      // Layout to apply after inserting the nodes/edges. Default "LR"
+      // (left-to-right data-flow). "none" preserves caller-supplied x/y
+      // — rarely the right choice; CC's hand-picked coordinates for
+      // 40-node canvases consistently produce unreadable diagrams, so
+      // the default path lets dagre own placement entirely.
+      layout?: "LR" | "TB" | "none";
     },
   ): Promise<{ nodes_created: number; edges_created: number }> {
     const file = this.getCanvas(canvasId);
@@ -545,9 +616,16 @@ export class CanvasStore {
       });
     }
 
-    // Commit atomically: all nodes, then all edges, one file write.
+    // Commit atomically: all nodes, then all edges, optionally lay out,
+    // one file write.
     file.nodes.push(...createdNodes);
     file.edges.push(...createdEdges);
+
+    const layout = input.layout ?? "LR";
+    if (layout !== "none") {
+      applyDagreLayout(file, layout);
+    }
+
     file.canvas.updated_at = Date.now();
     await writeCanvasFile(this.workspaceId, file);
 
@@ -613,51 +691,20 @@ export class CanvasStore {
   // matches the existing visual container rendering. Dagre handles cycles
   // internally via greedy FAS; no special-case needed.
   //
-  // Coordinate mapping: dagre uses top-left origin with CENTER-point node
-  // coords. Schematic uses bottom-left origin with BOTTOM-LEFT-corner
-  // coords. We convert in the post-pass.
+  // nodesep/ranksep are exposed for power-user tuning — the defaults are
+  // opinionated for readability on the 10–60 node canvases CC produces
+  // from typical "diagram the X" prompts.
   async autoLayout(
     canvasId: string,
     direction: "LR" | "TB" = "LR",
+    nodesep?: number,
+    ranksep?: number,
   ): Promise<{ nodes_laid_out: number }> {
     const file = this.getCanvas(canvasId);
     if (file.nodes.length === 0) {
       throw new Error("canvas has no nodes to lay out");
     }
-
-    const g = new dagre.graphlib.Graph({ compound: true });
-    g.setGraph({ rankdir: direction, nodesep: 40, ranksep: 80, marginx: 20, marginy: 20 });
-    g.setDefaultEdgeLabel(() => ({}));
-
-    const processes = new Set<string>();
-    for (const n of file.nodes) {
-      g.setNode(n.id, { width: n.width, height: n.height });
-      if (n.process) processes.add(n.process);
-    }
-    for (const p of processes) g.setNode(`cluster_${p}`, {});
-    for (const n of file.nodes) {
-      if (n.process) g.setParent(n.id, `cluster_${n.process}`);
-    }
-    for (const e of file.edges) g.setEdge(e.src, e.dst);
-
-    dagre.layout(g);
-
-    // Dagre's d.y is the node's center in top-left coords. Bottom edge
-    // in top-left space = d.y + d.height/2. Flip to bottom-left by
-    // subtracting from the max bottom value.
-    let maxBottomTopLeft = 0;
-    for (const n of file.nodes) {
-      const d = g.node(n.id);
-      const bottomTL = d.y + d.height / 2;
-      if (bottomTL > maxBottomTopLeft) maxBottomTopLeft = bottomTL;
-    }
-    for (const n of file.nodes) {
-      const d = g.node(n.id);
-      n.x = d.x - n.width / 2;
-      // Bottom-left Y of this node = canvasHeight - (top-left bottom edge).
-      n.y = maxBottomTopLeft - (d.y + n.height / 2);
-    }
-
+    applyDagreLayout(file, direction, nodesep, ranksep);
     file.canvas.updated_at = Date.now();
     await writeCanvasFile(this.workspaceId, file);
     return { nodes_laid_out: file.nodes.length };

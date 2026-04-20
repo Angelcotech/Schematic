@@ -354,9 +354,14 @@ export function createRequestHandler(
             label?: string;
             kind?: CanvasEdgeKind;
           }>;
+          layout?: "LR" | "TB" | "none";
         };
         const nodes = body.nodes ?? [];
         const edges = body.edges ?? [];
+        if (body.layout !== undefined &&
+            body.layout !== "LR" && body.layout !== "TB" && body.layout !== "none") {
+          return err(res, 400, `layout must be "LR", "TB", or "none", got "${body.layout}"`);
+        }
         // Validate — client_id and file_path required per node; src/dst
         // required per edge. Fail the whole call on any malformed entry;
         // no partial state.
@@ -396,6 +401,7 @@ export function createRequestHandler(
               ...(e.label !== undefined ? { label: e.label } : {}),
               ...(e.kind !== undefined ? { kind: e.kind } : {}),
             })),
+            ...(body.layout !== undefined ? { layout: body.layout } : {}),
           });
           broadcastContentChanged(ctx, wid, cid);
           return json(res, 201, result);
@@ -481,14 +487,24 @@ export function createRequestHandler(
         const wid = autoLayoutMatch[1];
         const cid = autoLayoutMatch[2];
         if (!ctx.registry.get(wid)) return err(res, 404, "unknown workspace");
-        const body = JSON.parse(await readBody(req)) as { direction?: string };
+        const body = JSON.parse(await readBody(req)) as {
+          direction?: string;
+          nodesep?: number;
+          ranksep?: number;
+        };
         const direction = body.direction ?? "LR";
         if (direction !== "LR" && direction !== "TB") {
           return err(res, 400, `direction must be "LR" or "TB", got "${direction}"`);
         }
+        if (body.nodesep !== undefined && (!Number.isFinite(body.nodesep) || body.nodesep < 0)) {
+          return err(res, 400, "nodesep must be a non-negative finite number");
+        }
+        if (body.ranksep !== undefined && (!Number.isFinite(body.ranksep) || body.ranksep < 0)) {
+          return err(res, 400, "ranksep must be a non-negative finite number");
+        }
         const store = await ctx.canvasStores.getOrLoad(wid);
         try {
-          const result = await store.autoLayout(cid, direction);
+          const result = await store.autoLayout(cid, direction, body.nodesep, body.ranksep);
           broadcastContentChanged(ctx, wid, cid);
           return json(res, 200, result);
         } catch (e) {
@@ -813,8 +829,9 @@ function buildSchematicPrime(payload: HookPayload): string | null {
   return [
     "[Schematic prime] The Schematic MCP server is registered in this session.",
     "When the user asks for a schematic, diagram, or architecture map, use the Schematic MCP tools to build a live canvas — NOT a markdown file.",
-    "Load the tools first: ToolSearch with query \"schematic\". That surfaces create_canvas, bulk_populate, list_canvases, add_node, add_edge, move_node, delete_node, trace_impact, audit_canvas, find_hubs, find_orphans, find_cycles.",
+    "Load the tools first: ToolSearch with query \"schematic\". That surfaces create_canvas, bulk_populate, move_process, auto_layout, list_canvases, add_node, add_edge, move_node, delete_node, trace_impact, audit_canvas, find_hubs, find_orphans, find_cycles.",
     "Workflow for new canvases: create_canvas → bulk_populate with all nodes + edges in ONE call. Do NOT call add_node / add_edge in a loop — that's 40+ tool calls and is the wrong tool for initial population.",
+    "Do not compute x/y coordinates for nodes in bulk_populate. Schematic auto-lays-out the canvas after insert (dagre, left-to-right). Hand-picked coordinates consistently produce worse diagrams than the auto-layout. Spend the token budget on descriptive process labels and edge labels — those are what readers look at.",
     "Use add_node / add_edge only for incremental edits after the canvas exists.",
     "The canvas renders live at http://localhost:7777.",
     "Do not author a .md file named SCHEMATIC/ARCHITECTURE/DIAGRAM unless the user explicitly asks for markdown.",
