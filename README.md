@@ -35,15 +35,17 @@ Every right-click action runs the query, packs the result into a Claude-ready pr
 
 ## What Claude can do
 
-Fourteen MCP tools ship in the box:
+Sixteen MCP tools ship in the box:
 
 **Workspace management:** `open_workspace`, `list_workspaces`, `switch_view`, `pause_workspace`.
 
-**Canvas authoring:** `create_canvas`, `bulk_populate`, `list_canvases`, `add_node`, `add_edge`, `move_node`, `delete_node`, `delete_edge`.
+**Canvas authoring:** `create_canvas`, `bulk_populate`, `list_canvases`, `add_node`, `add_edge`, `move_node`, `move_process`, `auto_layout`, `delete_node`, `delete_edge`.
 
 **Structural queries:** `trace_impact` (blast radius before refactors), `audit_canvas` (drift vs disk), `find_hubs` (high-degree keystones), `find_orphans` (zero-edge nodes), `find_cycles` (circular dependencies).
 
 `bulk_populate` is the intended path for building a canvas from scratch — one call takes the whole node + edge set and lands the canvas atomically. Use `add_node` / `add_edge` only for incremental edits.
+
+`auto_layout` runs a Sugiyama layered layout (via dagre) over the whole canvas in one call — respects process groupings, cleans up tangled diagrams. Use it after `bulk_populate` if the canvas reads messy, or whenever a hand-placed diagram has grown unreadable. `move_process` shifts a whole process group as a unit without touching individual nodes.
 
 All five structural-query tools return JSON, so Claude can reason over the shape instead of parsing prose.
 

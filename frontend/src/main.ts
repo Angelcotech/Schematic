@@ -1514,16 +1514,31 @@ async function reloadWorkspaceScope(workspaceId: string | null): Promise<void> {
 
 async function switchCanvas(canvasId: string): Promise<void> {
   if (!app.activeWorkspaceId) return;
+  // Claim the id BEFORE the await so canvas.content_changed events that
+  // arrive during the fetch pass the activeCanvasId guard in the WS
+  // handler. Without this, a CC session that fires create_canvas quickly
+  // followed by bulk_populate has its content_changed dropped — the
+  // canvas renders blank until manual refresh. Clear nodes/edges too so
+  // the UI doesn't briefly paint the old canvas's content under the new
+  // id while the fetch is in flight.
+  app.activeCanvasId = canvasId;
+  app.nodes = [];
+  app.edges = [];
+  app.selectedNodeIds.clear();
+  renderTabs();
+  updateEmptyState();
+  requestFrame();
+
   const file = await fetchJSON<{ canvas: Canvas; nodes: CanvasNode[]; edges: CanvasEdge[] }>(
     `/workspaces/${app.activeWorkspaceId}/canvases/${canvasId}`,
   );
-  app.activeCanvasId = canvasId;
+  // Rapid tab-switch guard: if another switch landed while we were
+  // fetching (user clicked tab-A then tab-B during A's fetch), drop this
+  // result instead of clobbering the newer one.
+  if (app.activeCanvasId !== canvasId) return;
   app.nodes = file.nodes;
   app.edges = file.edges;
-  app.selectedNodeIds.clear();
   fitToNodes();
-  renderTabs();
-  updateEmptyState();
   requestFrame();
 }
 
@@ -1543,9 +1558,12 @@ function scheduleCanvasRefresh(canvasId: string): void {
 
 async function refreshCanvasContent(canvasId: string): Promise<void> {
   if (!app.activeWorkspaceId || app.activeCanvasId !== canvasId) return;
+  const wasEmpty = app.nodes.length === 0;
   const file = await fetchJSON<{ canvas: Canvas; nodes: CanvasNode[]; edges: CanvasEdge[] }>(
     `/workspaces/${app.activeWorkspaceId}/canvases/${canvasId}`,
   );
+  // Late-return guard: another switch may have landed while we fetched.
+  if (app.activeCanvasId !== canvasId) return;
   // Only replace content — keep viewport, selection, hover state.
   app.nodes = file.nodes;
   app.edges = file.edges;
@@ -1553,6 +1571,16 @@ async function refreshCanvasContent(canvasId: string): Promise<void> {
   const liveIds = new Set(file.nodes.map((n) => n.id));
   for (const id of Array.from(app.selectedNodeIds)) {
     if (!liveIds.has(id)) app.selectedNodeIds.delete(id);
+  }
+  // If the canvas was empty and now has nodes, fit the viewport so
+  // the freshly-populated nodes are on-screen. Without this, CC-driven
+  // bulk_populate on a just-created canvas races switchCanvas, lands
+  // here with wasEmpty=true, populates nodes — but leaves the viewport
+  // at the previous canvas's bounds, so the user sees blank until they
+  // manually refresh. Preserves viewport in the normal "incremental
+  // edit" case where wasEmpty is false.
+  if (wasEmpty && file.nodes.length > 0) {
+    fitToNodes();
   }
   requestFrame();
 }

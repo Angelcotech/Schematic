@@ -9,6 +9,7 @@
 import { randomUUID } from "node:crypto";
 import { access } from "node:fs/promises";
 import { join } from "node:path";
+import dagre from "dagre";
 import type {
   Canvas,
   CanvasEdge,
@@ -576,6 +577,90 @@ export class CanvasStore {
     file.canvas.updated_at = Date.now();
     await writeCanvasFile(this.workspaceId, file);
     return node;
+  }
+
+  // Translate every node with a matching `process` label by (dx, dy).
+  // Zero-match is treated as an error — catching it silently would let a
+  // typo'd process name result in an apparent no-op, which is harder to
+  // debug than a loud failure.
+  async moveProcess(
+    canvasId: string,
+    processName: string,
+    dx: number,
+    dy: number,
+  ): Promise<{ nodes_moved: number }> {
+    const file = this.getCanvas(canvasId);
+    const matching = file.nodes.filter((n) => n.process === processName);
+    if (matching.length === 0) {
+      const e = new Error(`no nodes found with process="${processName}"`);
+      (e as NodeJS.ErrnoException).code = "ENOENT";
+      throw e;
+    }
+    for (const n of matching) {
+      n.x += dx;
+      n.y += dy;
+    }
+    file.canvas.updated_at = Date.now();
+    await writeCanvasFile(this.workspaceId, file);
+    return { nodes_moved: matching.length };
+  }
+
+  // Sugiyama layered layout via dagre. Replaces every node's (x, y) with
+  // the computed position. Full overwrite by design — the tool's purpose
+  // is cleanup of tangled diagrams, not preservation of prior placement.
+  //
+  // Compound clusters keep same-`process` nodes spatially grouped, which
+  // matches the existing visual container rendering. Dagre handles cycles
+  // internally via greedy FAS; no special-case needed.
+  //
+  // Coordinate mapping: dagre uses top-left origin with CENTER-point node
+  // coords. Schematic uses bottom-left origin with BOTTOM-LEFT-corner
+  // coords. We convert in the post-pass.
+  async autoLayout(
+    canvasId: string,
+    direction: "LR" | "TB" = "LR",
+  ): Promise<{ nodes_laid_out: number }> {
+    const file = this.getCanvas(canvasId);
+    if (file.nodes.length === 0) {
+      throw new Error("canvas has no nodes to lay out");
+    }
+
+    const g = new dagre.graphlib.Graph({ compound: true });
+    g.setGraph({ rankdir: direction, nodesep: 40, ranksep: 80, marginx: 20, marginy: 20 });
+    g.setDefaultEdgeLabel(() => ({}));
+
+    const processes = new Set<string>();
+    for (const n of file.nodes) {
+      g.setNode(n.id, { width: n.width, height: n.height });
+      if (n.process) processes.add(n.process);
+    }
+    for (const p of processes) g.setNode(`cluster_${p}`, {});
+    for (const n of file.nodes) {
+      if (n.process) g.setParent(n.id, `cluster_${n.process}`);
+    }
+    for (const e of file.edges) g.setEdge(e.src, e.dst);
+
+    dagre.layout(g);
+
+    // Dagre's d.y is the node's center in top-left coords. Bottom edge
+    // in top-left space = d.y + d.height/2. Flip to bottom-left by
+    // subtracting from the max bottom value.
+    let maxBottomTopLeft = 0;
+    for (const n of file.nodes) {
+      const d = g.node(n.id);
+      const bottomTL = d.y + d.height / 2;
+      if (bottomTL > maxBottomTopLeft) maxBottomTopLeft = bottomTL;
+    }
+    for (const n of file.nodes) {
+      const d = g.node(n.id);
+      n.x = d.x - n.width / 2;
+      // Bottom-left Y of this node = canvasHeight - (top-left bottom edge).
+      n.y = maxBottomTopLeft - (d.y + n.height / 2);
+    }
+
+    file.canvas.updated_at = Date.now();
+    await writeCanvasFile(this.workspaceId, file);
+    return { nodes_laid_out: file.nodes.length };
   }
 
   async deleteNode(canvasId: string, nodeId: string): Promise<void> {

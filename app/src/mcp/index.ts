@@ -467,6 +467,79 @@ server.tool(
 );
 
 server.tool(
+  "move_process",
+  `Translate every node sharing a process label by (dx, dy) in a single call. Use this when you need to shift a whole process group as a unit — much cheaper than moving each node individually.
+
+Arguments:
+- canvas_id: target canvas, from list_canvases or create_canvas.
+- process_name: exact match on the node's \`process\` field. Case-sensitive.
+- dx, dy: offset in canvas-space units. Negative values translate left/down. (0, 0) is a no-op but still validates the process name exists.
+
+Errors loud: if no nodes match process_name, the call returns an error. Don't catch-and-retry — read the error, call list_canvases or inspect the canvas to find the right label, try again.`,
+  {
+    canvas_id: z.string(),
+    process_name: z.string(),
+    dx: z.number(),
+    dy: z.number(),
+  },
+  async ({ canvas_id, process_name, dx, dy }) => {
+    const ws = await sessionWorkspace();
+    if (!ws) return daemonDownResponse(NO_FOCUS_MSG);
+    const r = await postOrNull<{ nodes_moved: number }>(
+      `/workspaces/${ws.id}/canvases/${canvas_id}/move_process`,
+      { process_name, dx, dy },
+    );
+    if (!r) {
+      return daemonDownResponse(
+        `move_process failed. Check the canvas_id and that process_name="${process_name}" matches at least one node.`,
+      );
+    }
+    return {
+      content: [
+        { type: "text", text: `Moved ${r.nodes_moved} nodes by (${dx}, ${dy}).` },
+      ],
+    };
+  },
+);
+
+server.tool(
+  "auto_layout",
+  `Clean up a tangled canvas by running a Sugiyama layered layout (via dagre) over every node and edge. One call replaces dozens of move_node calls for initial placement, and respects process groupings — same-process nodes are kept spatially clustered.
+
+Arguments:
+- canvas_id: target canvas.
+- direction: optional. "LR" (default, left-to-right — data-flow style) or "TB" (top-to-bottom — classic org-chart style).
+
+Behavior: full overwrite. Every node gets a new (x, y). Prior placements are replaced. Edges are considered for routing but their labels/kinds are untouched. The tool is destructive for hand-adjusted positions — use it for initial layout or when a diagram has become unreadable, not for minor tweaks.
+
+Returns { nodes_laid_out: N }. Errors if the canvas is empty.`,
+  {
+    canvas_id: z.string(),
+    direction: z.enum(["LR", "TB"]).optional(),
+  },
+  async ({ canvas_id, direction }) => {
+    const ws = await sessionWorkspace();
+    if (!ws) return daemonDownResponse(NO_FOCUS_MSG);
+    const body: { direction?: "LR" | "TB" } = {};
+    if (direction !== undefined) body.direction = direction;
+    const r = await postOrNull<{ nodes_laid_out: number }>(
+      `/workspaces/${ws.id}/canvases/${canvas_id}/auto_layout`,
+      body,
+    );
+    if (!r) {
+      return daemonDownResponse(
+        "auto_layout failed. Check the canvas_id exists and has at least one node.",
+      );
+    }
+    return {
+      content: [
+        { type: "text", text: `Laid out ${r.nodes_laid_out} nodes (direction=${direction ?? "LR"}).` },
+      ],
+    };
+  },
+);
+
+server.tool(
   "delete_node",
   "Remove a node from a canvas. Any edges touching the node are deleted too — a dangling edge would be an illegal state.",
   { canvas_id: z.string(), node_id: z.string() },

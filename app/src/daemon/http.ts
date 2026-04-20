@@ -436,6 +436,66 @@ export function createRequestHandler(
         return json(res, 201, node);
       }
 
+      // POST /workspaces/:wid/canvases/:cid/move_process
+      // { process_name, dx, dy } — translate every node sharing the
+      // process label by (dx, dy) in one call. The right tool for
+      // repositioning a whole process group as a unit.
+      const moveProcessMatch =
+        /^\/workspaces\/([^/]+)\/canvases\/([^/]+)\/move_process$/.exec(path);
+      if (method === "POST" && moveProcessMatch) {
+        const wid = moveProcessMatch[1];
+        const cid = moveProcessMatch[2];
+        if (!ctx.registry.get(wid)) return err(res, 404, "unknown workspace");
+        const body = JSON.parse(await readBody(req)) as {
+          process_name?: string;
+          dx?: number;
+          dy?: number;
+        };
+        if (typeof body.process_name !== "string" || body.process_name.length === 0) {
+          return err(res, 400, "missing field: process_name");
+        }
+        if (typeof body.dx !== "number" || !Number.isFinite(body.dx)) {
+          return err(res, 400, "dx must be a finite number");
+        }
+        if (typeof body.dy !== "number" || !Number.isFinite(body.dy)) {
+          return err(res, 400, "dy must be a finite number");
+        }
+        const store = await ctx.canvasStores.getOrLoad(wid);
+        try {
+          const result = await store.moveProcess(cid, body.process_name, body.dx, body.dy);
+          broadcastContentChanged(ctx, wid, cid);
+          return json(res, 200, result);
+        } catch (e) {
+          const code = (e as NodeJS.ErrnoException).code;
+          return err(res, code === "ENOENT" ? 404 : 400, (e as Error).message);
+        }
+      }
+
+      // POST /workspaces/:wid/canvases/:cid/auto_layout
+      // { direction?: "LR" | "TB" } — Sugiyama layered layout via dagre.
+      // Replaces every node's (x, y) with the computed position. Full
+      // overwrite by design — the tool's purpose is a clean re-layout.
+      const autoLayoutMatch =
+        /^\/workspaces\/([^/]+)\/canvases\/([^/]+)\/auto_layout$/.exec(path);
+      if (method === "POST" && autoLayoutMatch) {
+        const wid = autoLayoutMatch[1];
+        const cid = autoLayoutMatch[2];
+        if (!ctx.registry.get(wid)) return err(res, 404, "unknown workspace");
+        const body = JSON.parse(await readBody(req)) as { direction?: string };
+        const direction = body.direction ?? "LR";
+        if (direction !== "LR" && direction !== "TB") {
+          return err(res, 400, `direction must be "LR" or "TB", got "${direction}"`);
+        }
+        const store = await ctx.canvasStores.getOrLoad(wid);
+        try {
+          const result = await store.autoLayout(cid, direction);
+          broadcastContentChanged(ctx, wid, cid);
+          return json(res, 200, result);
+        } catch (e) {
+          return err(res, 400, (e as Error).message);
+        }
+      }
+
       // PATCH /workspaces/:wid/canvases/:cid/nodes/:nid
       // DELETE /workspaces/:wid/canvases/:cid/nodes/:nid
       const nodeIdMatch =
